@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Crosshair+</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body data-tab="aim">
+<header class="topbar">
+  <div class="brand" aria-hidden="true"></div>
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab active" data-action="tab" data-tab="aim" role="tab" aria-selected="true" aria-controls="view-aim" tabindex="0"><img class="tab-icon" src="/assets/icon.png" alt=""><span>Aim</span></button>
+    <button class="tab" data-action="tab" data-tab="display" role="tab" aria-selected="false" aria-controls="view-display" tabindex="-1">🖥️ Display</button>
+    <button class="tab" data-action="tab" data-tab="audio" role="tab" aria-selected="false" aria-controls="view-audio" tabindex="-1">🔊 Audio</button>
+    <button class="tab" data-action="tab" data-tab="slots" role="tab" aria-selected="false" aria-controls="view-slots" tabindex="-1">⚡ Slots</button>
+  </nav>
+</header>
+
+<main id="main">
+  <section id="view-aim" class="view active" data-view="aim">
+    <div class="three-column">
+      <aside class="rail">
+        <div class="card preview-card">
+          <div class="card-heading"><h2>Aim Preview</h2></div>
+          <div class="preview-stage" id="aimStage">
+            <img id="sceneImage" class="scene" alt="" draggable="false">
+            <img id="aimPreview" class="crosshair-preview" alt="Crosshair preview" draggable="false">
+            <div class="preview-crosshair-fallback" id="previewFallback" aria-hidden="true"></div>
+            <div class="daynight-pill">
+              <button class="pill-button active" data-action="day-night" data-value="day">☀️ Day</button>
+              <button class="pill-button" data-action="day-night" data-value="night">🌙 Night</button>
+            </div>
+          </div>
+          <div class="monitor-line"><span>Monitor</span><strong id="aimMonitor">—</strong></div>
+          <select id="aimMonitorSelect" class="select monitor-select hidden" data-bind="crosshair.monitor" data-mod="crosshair" aria-label="Aim monitor"></select>
+        </div>
+        <div class="card">
+          <div class="card-heading"><h2>Behavior</h2></div>
+          <div class="row-toggle"><span title="Hides the crosshair while Start, taskbar, desktop or app menus are open.">Hide in Windows menus</span><label class="switch"><input type="checkbox" data-bind="crosshair.hide_in_menus" data-mod="crosshair" aria-label="Hide in Windows menus: hides the crosshair while Start, taskbar, desktop or app menus are open"><i></i></label></div>
+          <div class="aim-visibility">
+            <span class="aim-visibility-label" title="Always shows the crosshair, hides it while aiming, or shows it only while aiming.">Aim visibility</span>
+            <div class="segmented" id="aimVisibility" role="group" aria-label="Aim visibility">
+              <button class="seg" type="button" data-action="aim-visibility" data-value="always" aria-pressed="false">Always</button>
+              <button class="seg" type="button" data-action="aim-visibility" data-value="hide" aria-pressed="false">Hide on Aim</button>
+              <button class="seg" type="button" data-action="aim-visibility" data-value="only" aria-pressed="false">Only on Aim</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <div class="content">
+        <div class="preset-toolbar">
+          <button class="preset-trigger" id="aimPresetTrigger" data-action="open-preset" data-module="crosshair" aria-haspopup="listbox" aria-expanded="false">
+            <img id="aimPresetIcon" src="/assets/presets/plus.png" alt="">
+            <span id="aimPresetName">Pro Plus</span><b>▾</b>
+          </button>
+          <button class="icon-button add" data-action="save-preset" data-module="crosshair" title="Save current crosshair as a preset" aria-label="Save preset">＋</button>
+          <button class="icon-button delete" id="aimPresetDelete" data-action="delete-active-preset" data-module="crosshair" title="Delete custom preset" aria-label="Delete preset" disabled>✕</button>
+          <div class="preset-menu hidden" id="aimPresetMenu" role="listbox"></div>
+        </div>
+
+        <div class="mode-switch" role="tablist" aria-label="Crosshair mode">
+          <button class="mode-button active" data-action="aim-mode" data-value="shape">🎯 Shape</button>
+          <button class="mode-button" data-action="aim-mode" data-value="image">🖼️ Custom Image / GIF</button>
+        </div>
+
+        <div id="shapePanel">
+          <div class="two-column">
+            <div class="card">
+              <div class="card-heading"><h2>Shape</h2></div>
+              <label class="range-row"><span>Size</span><input type="range" min="2" max="48" step="1" data-bind="crosshair.size" data-mod="crosshair"><em data-readout="crosshair.size">18</em></label>
+              <label class="range-row"><span>Thickness</span><input type="range" min="1" max="10" step="0.5" data-bind="crosshair.thickness" data-mod="crosshair"><em data-readout="crosshair.thickness">2</em></label>
+              <label class="range-row" id="gapRow"><span>Gap</span><input type="range" min="0" max="24" step="1" data-bind="crosshair.gap" data-mod="crosshair"><em data-readout="crosshair.gap">4</em></label>
+              <label class="range-row"><span>Opacity</span><input type="range" min="10" max="100" step="1" data-bind="crosshair.opacity" data-mod="crosshair"><em data-readout="crosshair.opacity">100%</em></label>
+            </div>
+            <div class="card">
+              <div class="card-heading"><h2>Color</h2><strong class="readout-value" id="colorValue">#4EA8FF</strong></div>
+              <div class="swatches" id="swatches">
+                <button class="swatch active" data-action="color" data-value="#4EA8FF" style="--c:#4EA8FF" aria-label="Blue"></button>
+                <button class="swatch" data-action="color" data-value="#FF6B6B" style="--c:#FF6B6B" aria-label="Red"></button>
+                <button class="swatch" data-action="color" data-value="#5CE693" style="--c:#5CE693" aria-label="Green"></button>
+                <button class="swatch" data-action="color" data-value="#B692FF" style="--c:#B692FF" aria-label="Violet"></button>
+                <button class="swatch" data-action="color" data-value="#FFFFFF" style="--c:#FFFFFF" aria-label="White"></button>
+                <button class="swatch" data-action="color" data-value="#FFE600" style="--c:#FFE600" aria-label="Yellow"></button>
+                <div class="color-control">
+                  <button class="color-trigger" id="colorTrigger" type="button" title="Custom color" aria-label="Custom color" aria-haspopup="dialog" aria-expanded="false"><span></span></button>
+                  <div class="color-popover hidden" id="colorPopover" role="dialog" aria-label="Custom color">
+                    <div class="color-sv" id="colorSv"><span class="color-sv-knob" id="colorSvKnob"></span></div>
+                    <input class="color-hue" id="colorHue" type="range" min="0" max="360" step="1" aria-label="Hue">
+                    <div class="color-popover-foot">
+                      <span>HEX</span>
+                      <input class="color-hex" id="colorHex" maxlength="7" spellcheck="false" aria-label="Hex colour">
+                      <button class="text-button" type="button" data-action="close-color">Done</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="row-toggle"><span>Center dot</span><label class="switch"><input type="checkbox" data-bind="crosshair.dot" data-mod="crosshair"><i></i></label></div>
+              <label class="range-row hidden" id="dotSizeRow"><span>Dot size</span><input type="range" min="1" max="16" step="1" data-bind="crosshair.dot_size" data-mod="crosshair"><em data-readout="crosshair.dot_size">2</em></label>
+              <div class="row-toggle"><span>Dark outline</span><label class="switch"><input type="checkbox" data-bind="crosshair.outline" data-mod="crosshair"><i></i></label></div>
+              <label class="range-row hidden" id="outlineWidthRow"><span>Outline width</span><input type="range" min="0" max="6" step="0.5" data-bind="crosshair.outline_width" data-mod="crosshair"><em data-readout="crosshair.outline_width">1</em></label>
+            </div>
+          </div>
+          <div class="more-options">
+            <div class="two-column">
+              <div class="advanced-block">
+                <label class="range-row"><span>Rotation</span><input type="range" min="0" max="360" step="1" data-bind="crosshair.rotation" data-mod="crosshair"><em data-readout="crosshair.rotation">0°</em></label>
+              </div>
+              <div class="field-pair stepper-pair">
+                <div class="stepper-field"><span>Offset X</span><div class="stepper-input"><input type="number" min="-300" max="300" data-bind="crosshair.offset_x" data-mod="crosshair" data-int="1" aria-label="Offset X"><div class="stepper-buttons"><button type="button" data-action="step" data-target="crosshair.offset_x" data-step="1" aria-label="Increase Offset X">▲</button><button type="button" data-action="step" data-target="crosshair.offset_x" data-step="-1" aria-label="Decrease Offset X">▼</button></div></div></div>
+                <div class="stepper-field"><span>Offset Y</span><div class="stepper-input"><input type="number" min="-300" max="300" data-bind="crosshair.offset_y" data-mod="crosshair" data-int="1" aria-label="Offset Y"><div class="stepper-buttons"><button type="button" data-action="step" data-target="crosshair.offset_y" data-step="1" aria-label="Increase Offset Y">▲</button><button type="button" data-action="step" data-target="crosshair.offset_y" data-step="-1" aria-label="Decrease Offset Y">▼</button></div></div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="imagePanel" class="hidden">
+          <div class="card">
+            <div class="card-heading"><h2>Custom Image / GIF</h2><button class="text-button" data-action="remove-image">Remove</button></div>
+            <div class="dropzone" id="dropzone" data-action="import-image" tabindex="0" role="button">
+              <span class="drop-icon">＋</span>
+              <div><strong id="imageName">Drop PNG / JPG / WebP / GIF / SVG / BMP / ICO or click to browse</strong><span>Transparent images work best.</span></div>
+            </div>
+            <div class="image-options hidden" id="imageOptions">
+              <div class="image-grid">
+                <div class="image-mode-block">
+                  <span class="image-field-label">Mode</span>
+                  <div class="mode-switch compact image-mode-switch" id="solidMode">
+                    <button class="mode-button active" data-action="image-mode" data-value="original">Original</button>
+                    <button class="mode-button" data-action="image-mode" data-value="solid">Solid Color</button>
+                    <button class="mode-button" data-action="image-mode" data-value="tint">Tint</button>
+                  </div>
+                  <label class="solid-color-row hidden" id="solidColorRow"><span id="modeColorLabel">Silhouette color</span><input type="color" data-bind="crosshair.image_solid_color" data-mod="crosshair" value="#FFFFFF"></label>
+                  <div class="row-toggle"><span>Invert colors</span><label class="switch"><input type="checkbox" data-bind="crosshair.image_invert" data-mod="crosshair"><i></i></label></div>
+                </div>
+                <div class="image-sliders">
+                  <label class="range-row"><span>Scale</span><input type="range" min="10" max="300" step="5" data-bind="crosshair.image_scale" data-mod="crosshair"><em data-readout="crosshair.image_scale">100%</em></label>
+                  <label class="range-row"><span>Opacity</span><input type="range" min="10" max="100" step="1" data-bind="crosshair.opacity" data-mod="crosshair"><em data-readout="crosshair.opacity">100%</em></label>
+                  <label class="range-row"><span>Rotation</span><input type="range" min="0" max="360" step="1" data-bind="crosshair.image_rotation" data-mod="crosshair"><em data-readout="crosshair.image_rotation">0°</em></label>
+                  <div id="gifOptions" class="gif-options hidden">
+                    <div class="row-toggle"><span>Animation playback</span><label class="switch"><input type="checkbox" data-bind="crosshair.gif_playing" data-mod="crosshair"><i></i></label></div>
+                    <label class="range-row"><span>Speed</span><input type="range" min="0.25" max="2" step="0.05" data-bind="crosshair.gif_speed" data-mod="crosshair"><em data-readout="crosshair.gif_speed">1.00×</em></label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-display" class="view" data-view="display">
+    <div class="three-column">
+      <aside class="rail">
+        <div class="card preview-card">
+          <div class="card-heading"><h2>Calibration Preview</h2></div>
+          <div class="preview-stage" id="displayStage">
+            <canvas id="lutCanvas" width="960" height="540" aria-label="Calibrated display preview"></canvas>
+            <img id="lutPreview" class="lut-preview" alt="" draggable="false">
+            <div class="daynight-pill">
+              <button class="pill-button active" data-action="day-night" data-value="day">☀️ Day</button>
+              <button class="pill-button" data-action="day-night" data-value="night">🌙 Night</button>
+            </div>
+          </div>
+        </div>
+        <div class="card status-card">
+          <div class="card-heading"><h2>Screen Status</h2><strong id="displayStatus" class="status-value">PREVIEW</strong></div>
+          <div class="monitor-line"><span>Display</span><strong id="displayDevice">—</strong></div>
+          <p class="status-copy" id="hardwareInfo">Checking display capabilities…</p>
+          <div class="warning-banner hidden" id="displayWarning">
+            <div><strong id="warningTitle">HDR is active</strong><span id="warningText"></span></div>
+            <button class="button small" data-action="fix-display">Fix</button>
+          </div>
+          <div class="inline-actions">
+            <button class="button ghost" data-action="open-windows-display">Windows display settings</button>
+          </div>
+          <div id="multiMonitorControls" class="multi-monitor-controls hidden">
+            <div class="segmented" id="displayMode">
+              <button class="seg" data-action="display-mode" data-value="this">This display</button>
+              <button class="seg active" data-action="display-mode" data-value="all">All displays</button>
+            </div>
+            <div class="row-toggle"><span>Customize each display</span><label class="switch"><input type="checkbox" id="customizeEach" data-bind="display.customize_each" data-mod="display"><i></i></label></div>
+            <div class="monitor-pills" id="monitorPills"></div>
+          </div>
+        </div>
+      </aside>
+
+      <div class="content">
+        <div class="preset-toolbar">
+          <button class="preset-trigger" id="displayPresetTrigger" data-action="open-preset" data-module="display" aria-haspopup="listbox" aria-expanded="false">
+            <span class="preset-emoji">⚖️</span><span id="displayPresetName">Standard</span><b>▾</b>
+          </button>
+          <button class="icon-button add" data-action="save-preset" data-module="display" title="Save current calibration as a preset" aria-label="Save preset">＋</button>
+          <button class="icon-button delete" id="displayPresetDelete" data-action="delete-active-preset" data-module="display" title="Delete custom preset" aria-label="Delete preset" disabled>✕</button>
+          <div class="preset-menu hidden" id="displayPresetMenu" role="listbox"></div>
+        </div>
+        <div class="card">
+          <div class="card-heading"><h2>Calibration</h2><strong class="readout-value" id="displayModeReadout">All monitors</strong></div>
+          <label class="range-row"><span>Brightness</span><input type="range" min="-40" max="40" step="1" data-display="brightness"><em data-display-readout="brightness">0</em></label>
+          <label class="range-row"><span>Contrast</span><input type="range" min="-30" max="40" step="1" data-display="contrast"><em data-display-readout="contrast">0</em></label>
+          <label class="range-row"><span>Gamma</span><input type="range" min="0.5" max="2.5" step="0.01" data-display="gamma"><em data-display-readout="gamma">1.00</em></label>
+          <label class="range-row"><span>Warmth</span><input type="range" min="0" max="80" step="1" data-display="warmth"><em data-display-readout="warmth">0</em></label>
+          <div class="inline-actions display-tools">
+            <button class="button ghost" type="button" id="blueLightToggle" data-action="blue-light" aria-pressed="false" title="Toggle a comfortable warm tint without changing brightness, contrast or gamma.">🌙 Blue Light Filter</button>
+            <button class="button ghost" type="button" id="compareDisplay" aria-pressed="false" title="Hold to temporarily bypass this calibration. Release to restore it.">Hold to Compare</button>
+          </div>
+        </div>
+        <details class="more-options display-more" id="displayMore">
+          <summary>More options</summary>
+          <div class="display-advanced-grid">
+            <div class="advanced-block">
+              <label class="select-row"><span>Panel type</span><select id="panelSelect" class="select"></select></label>
+              <label class="range-row backlight-row hidden" id="backlightRow"><span>Backlight</span><input type="range" min="0" max="100" step="1" id="backlightRange"><em id="backlightReadout">—</em></label>
+              <button class="button ghost" data-action="reset-display">Reset colors</button>
+            </div>
+            <div class="display-channel-grid">
+              <label class="range-row channel-r"><span>Red</span><input type="range" min="50" max="120" step="1" data-display="r"><em data-display-readout="r">100</em></label>
+              <label class="range-row channel-g"><span>Green</span><input type="range" min="50" max="120" step="1" data-display="g"><em data-display-readout="g">100</em></label>
+              <label class="range-row channel-b"><span>Blue</span><input type="range" min="50" max="120" step="1" data-display="b"><em data-display-readout="b">100</em></label>
+            </div>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-audio" class="view" data-view="audio">
+    <div class="three-column">
+      <aside class="rail">
+        <div class="card graph-card">
+          <div class="card-heading"><h2>Live EQ Curve</h2><span class="live-label">LIVE</span></div>
+          <canvas id="eqCanvas" width="960" height="540" aria-label="EQ response graph"></canvas>
+          <div class="meter"><div class="meter-fill" id="meterFill"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-heading"><h2>Audio Setup</h2><strong id="fxState" class="status-value">CHECKING</strong></div>
+          <select id="audioDevice" class="select"></select>
+          <button class="button" id="setupAudio" data-action="setup-audio">⚡ Set up FxSound</button>
+          <button class="button ghost hidden" id="launchFx" data-action="open-fxsound">Launch FxSound</button>
+          <button class="update-badge hidden" id="fxUpdateBadge" data-action="open-fx-update">Update FxSound</button>
+          <p class="status-copy" id="fxMessage"></p>
+        </div>
+      </aside>
+
+      <div class="content">
+        <div class="preset-toolbar">
+          <button class="preset-trigger" id="audioPresetTrigger" data-action="open-preset" data-module="audio" aria-haspopup="listbox" aria-expanded="false">
+            <span class="preset-emoji">🎚️</span><span id="audioPresetName">Flat</span><b>▾</b>
+          </button>
+          <button class="icon-button add" data-action="save-preset" data-module="audio" title="Save current sound as a preset" aria-label="Save preset">＋</button>
+          <button class="icon-button delete" id="audioPresetDelete" data-action="delete-active-preset" data-module="audio" title="Delete custom preset" aria-label="Delete preset" disabled>✕</button>
+          <button class="button ghost import-button" data-action="open-import">📥 Import EQ</button>
+          <div class="preset-menu hidden" id="audioPresetMenu" role="listbox"></div>
+        </div>
+        <div class="import-status hidden" id="importStatus">
+          <span id="importName">No imported profile</span>
+          <button class="text-button" data-action="flatten-eq" title="Approximate the imported curve with the ten sliders and remove the imported layer">Apply imported curve to sliders</button>
+          <button class="text-button" data-action="clear-eq">Clear</button>
+        </div>
+
+        <div class="card eq-card">
+          <div class="hero-row">
+            <label class="hero-slider"><span>Bass Boost</span><input type="range" min="0" max="10" step="1" data-bind="audio.bass" data-mod="audio"><em data-readout="audio.bass">0</em></label>
+            <label class="hero-slider"><span>Clarity</span><input type="range" min="0" max="10" step="1" data-bind="audio.treble" data-mod="audio"><em data-readout="audio.treble">0</em></label>
+            <button class="button ghost" data-action="reset-audio">↺ Reset</button>
+          </div>
+          <div class="fader-grid" id="bandGrid"></div>
+        </div>
+        <details class="more-options audio-more" id="audioMore">
+          <summary>More options</summary>
+          <div class="two-column audio-options">
+            <div class="advanced-block">
+              <label class="range-row"><span>Ambience</span><input type="range" min="0" max="10" step="1" data-bind="audio.echo" data-mod="audio"><em data-readout="audio.echo">0</em></label>
+              <label class="range-row"><span>Surround</span><input type="range" min="0" max="10" step="1" data-bind="audio.surround" data-mod="audio"><em data-readout="audio.surround">0</em></label>
+              <label class="range-row"><span>Dynamic Boost</span><input type="range" min="0" max="10" step="1" data-bind="audio.dynamic_boost" data-mod="audio"><em data-readout="audio.dynamic_boost">0</em></label>
+              <label class="range-row"><span>Master Gain</span><input type="range" min="-20" max="20" step="1" data-bind="audio.output_level" data-mod="audio"><em data-readout="audio.output_level">0</em></label>
+            </div>
+            <div class="advanced-block">
+              <label class="range-row"><span>Volume Leveling</span><input type="range" min="0" max="4" step="0.5" data-bind="audio.volume_leveling" data-mod="audio"><em data-readout="audio.volume_leveling">0.0</em></label>
+              <label class="range-row"><span>Balance</span><input type="range" min="-20" max="20" step="1" data-bind="audio.balance" data-mod="audio"><em data-readout="audio.balance">0</em></label>
+              <label class="range-row"><span>Filter Q</span><input type="range" min="1" max="3" step="0.5" data-bind="audio.filter_q" data-mod="audio"><em data-readout="audio.filter_q">1.0</em></label>
+              <div class="row-toggle"><span>Clip guard</span><label class="switch"><input type="checkbox" data-bind="audio.volume_guard" data-mod="audio"><i></i></label></div>
+            </div>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-slots" class="view" data-view="slots">
+    <div class="slots-layout">
+      <aside class="slot-rail">
+        <div class="rail-head"><h2>Slots</h2><span class="readout-value" id="slotCount">3 / 6</span></div>
+        <div id="slotList" class="slot-list"></div>
+        <button class="button full-width" data-action="new-slot">＋ New Slot</button>
+        <p class="help-copy">A slot bundles aim, screen and sound. Assign a hotkey or a game to switch automatically.</p>
+      </aside>
+      <div class="content slot-editor" id="slotEditor"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar" aria-label="Session status and modules">
+  <div class="statusbar-slot">
+    <span class="statusbar-label">ACTIVE SLOT</span>
+    <button id="slotBadge" class="slot-badge" data-action="open-slots" title="Open Slots">NO ACTIVE SLOT</button>
+  </div>
+  <div class="module-switches" aria-label="Module switches">
+    <button class="quick-toggle" id="masterCrosshair" data-action="master" data-module="crosshair" aria-pressed="false"><span>🎯 Aim</span><i></i></button>
+    <button class="quick-toggle" id="masterDisplay" data-action="master" data-module="display" aria-pressed="false"><span>🖥️ Screen</span><i></i></button>
+    <button class="quick-toggle" id="masterAudio" data-action="master" data-module="audio" aria-pressed="false"><span>🔊 Sound</span><i></i></button>
+  </div>
+  <button class="icon-button statusbar-settings" data-action="settings" title="Settings" aria-label="Settings">⚙️</button>
+</footer>
+
+<div class="modal hidden" id="settingsModal" role="dialog" aria-modal="true" aria-label="Settings">
+  <div class="modal-backdrop" data-action="close-settings"></div>
+  <div class="modal-card">
+    <div class="modal-head"><div><span class="modal-kicker">Settings</span><h2>Crosshair+</h2></div><button class="icon-button" data-action="close-settings" aria-label="Close">✕</button></div>
+    <div class="settings-list">
+      <div class="row-toggle"><span>Launch with Windows</span><label class="switch"><input type="checkbox" id="setStartWindows"><i></i></label></div>
+      <div class="row-toggle"><span>Start minimized</span><label class="switch"><input type="checkbox" id="setStartMinimized"><i></i></label></div>
+      <div class="row-toggle"><span>Close to tray</span><label class="switch"><input type="checkbox" id="setMinimizeTray"><i></i></label></div>
+      <div class="row-toggle"><span>Restore display on exit</span><label class="switch"><input type="checkbox" id="setRestoreDisplay"><i></i></label></div>
+      <div class="row-toggle"><span>Global hotkeys</span><label class="switch"><input type="checkbox" id="setHotkeys"><i></i></label></div>
+      <div class="row-toggle"><span>Auto-revert slots</span><label class="switch"><input type="checkbox" id="setAutoRevert"><i></i></label></div>
+      <div class="row-toggle"><span>Show in-game notification pill</span><label class="switch"><input type="checkbox" id="setOsdToast"><i></i></label></div>
+    </div>
+    <div class="modal-section"><h3>Hotkeys</h3>
+      <div class="hotkey-settings">
+        <div class="hotkey-row"><span>🎯 Aim</span><button class="hotkey-field" type="button" data-module-hotkey="aim" id="setAimHotkey">F8</button></div>
+        <div class="hotkey-row"><span>🖥️ Display</span><button class="hotkey-field" type="button" data-module-hotkey="display" id="setDisplayHotkey">Set key</button></div>
+        <div class="hotkey-row"><span>🔊 Sound</span><button class="hotkey-field" type="button" data-module-hotkey="audio" id="setAudioHotkey">Set key</button></div>
+        <div class="hotkey-row"><span title="Returns the screen to normal and turns Display off.">🛟 Panic reset</span><button class="hotkey-field" type="button" data-module-hotkey="restore" id="setRestoreHotkey">Set key</button></div>
+        <div class="hotkey-row"><span>🔁 Cycle slots</span><button class="hotkey-field" type="button" data-module-hotkey="cycle" id="setCycleHotkey">Set key</button></div>
+      </div>
+    </div>
+    <div class="modal-section"><h3>Maintenance</h3>
+      <div class="maintenance-grid">
+        <button class="button ghost" data-action="open-fxsound">Open FxSound</button>
+        <button class="button ghost" data-action="unstick-audio" title="Fixes FxSound if audio stops or gets stuck">Refresh Audio</button>
+        <button class="button ghost" data-action="repair-audio" title="Cleanly reinstalls FxSound while preserving your sound settings">Reinstall Audio</button>
+        <button class="button ghost" data-action="open-data">App Folder</button>
+        <button class="button ghost" data-action="open-backup">Backups</button>
+        <button class="button danger" data-action="factory-reset">Reset All</button>
+      </div>
+      <button class="update-badge hidden" data-action="open-fx-update">Update FxSound</button>
+    </div>
+    <div class="modal-foot"><div class="settings-meta"><span class="readout-value" id="versionLabel">v1.0.0</span><button class="text-button settings-logs" data-action="open-log">View logs</button></div><button class="button primary" data-action="save-settings">Save</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="presetModal" role="dialog" aria-modal="true" aria-label="Save preset">
+  <div class="modal-backdrop" data-action="close-preset-modal"></div>
+  <div class="modal-card narrow">
+    <div class="modal-head"><div><span class="modal-kicker">Save preset</span><h2 id="presetModalTitle">New preset</h2></div><button class="icon-button" data-action="close-preset-modal" aria-label="Close">✕</button></div>
+    <label class="stacked-field"><span>Preset name</span><input id="presetName" maxlength="32" placeholder="My preset" autocomplete="off"></label>
+    <div class="modal-foot"><button class="button primary" data-action="submit-preset">Save preset</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="emojiModal" role="dialog" aria-modal="true" aria-label="Choose slot icon">
+  <div class="modal-backdrop" data-action="close-emoji-modal"></div>
+  <div class="modal-card">
+    <div class="modal-head"><div><span class="modal-kicker">Slot icon</span><h2>Pick an icon</h2></div><button class="icon-button" data-action="close-emoji-modal" aria-label="Close">✕</button></div>
+    <div class="emoji-grid" id="emojiGrid"></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="importModal" role="dialog" aria-modal="true" aria-label="Import EQ profile">
+  <div class="modal-backdrop" data-action="close-import-modal"></div>
+  <div class="modal-card narrow">
+    <div class="modal-head"><div><span class="modal-kicker">Import EQ</span><h2>Paste or choose a profile</h2></div><button class="icon-button" data-action="close-import-modal" aria-label="Close">✕</button></div>
+    <button class="button" data-action="import-eq-file">Choose a .txt / Equalizer APO file</button>
+    <textarea id="eqText" class="text-area" placeholder="GraphicEQ: 20 -1.2; 40 0.4; 80 1.8; …&#10;or Equalizer APO / AutoEq ParametricEQ text"></textarea>
+    <div class="modal-foot"><button class="button primary" data-action="submit-eq-text">Import pasted profile</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="fxModal" role="dialog" aria-modal="true" aria-label="Set up FxSound">
+  <div class="modal-backdrop" data-action="close-fx-modal"></div>
+  <div class="modal-card fx-modal-card">
+    <div class="modal-head"><div><h2 id="fxModalTitle">Set up FxSound</h2></div><button class="icon-button" data-action="close-fx-modal" aria-label="Close">✕</button></div>
+    <p class="fx-modal-copy" id="fxModalMessage">Install FxSound to enable live sound controls.</p>
+    <div class="fx-progress hidden" id="fxProgress"><div class="fx-progress-fill" id="fxProgressFill"></div></div>
+    <p class="status-copy" id="fxTaskText"></p>
+    <div class="fx-modal-actions">
+      <button class="button primary fx-task" id="fxInstallButton" data-action="setup-audio">Install FxSound</button>
+      <button class="button ghost fx-task hidden" id="fxRetryButton" data-action="setup-audio">Retry</button>
+      <button class="button ghost" data-action="open-fx-download">Download page</button>
+      <button class="button ghost" data-action="close-fx-modal">Not now</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal hidden" id="backupModal" role="dialog" aria-modal="true" aria-label="Backup and restore">
+  <div class="modal-backdrop" data-action="close-backup-modal"></div>
+  <div class="modal-card backup-modal-card">
+    <div class="modal-head"><div><span class="modal-kicker">Settings</span><h2>Backup &amp; restore</h2></div><button class="icon-button" data-action="close-backup-modal" aria-label="Close">✕</button></div>
+    <div class="backup-grid">
+      <div class="backup-panel">
+        <h3>Create backup</h3>
+        <p class="status-copy">Save custom presets, slots, crosshair images and the imported EQ profile in one file.</p>
+        <button class="button primary" data-action="backup-create">Save backup…</button>
+      </div>
+      <div class="backup-panel" id="backupDrop">
+        <h3>Restore backup</h3>
+        <p class="status-copy">Drop a Crosshair+ backup here, or choose a .zip file.</p>
+        <button class="button ghost" data-action="backup-browse">Choose .zip…</button>
+        <div class="backup-summary" id="backupSummary">No backup selected.</div>
+        <button class="button danger hidden" id="backupRestore" data-action="backup-restore">Restore this backup</button>
+      </div>
+    </div>
+    <div class="modal-foot"><span class="status-copy" id="backupStatus"></span><button class="button ghost hidden" id="backupUndo" data-action="backup-undo">Undo last restore</button><button class="button ghost" data-action="close-backup-modal">Close</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="gamesModal" role="dialog" aria-modal="true" aria-labelledby="gamesTitle">
+  <div class="modal-backdrop" data-action="close-games"></div>
+  <div class="modal-card games-card">
+    <div class="modal-head"><div><span class="modal-kicker">Auto-launch</span><h2 id="gamesTitle">Installed games</h2></div><button class="icon-button" data-action="close-games" aria-label="Close">✕</button></div>
+    <p class="status-copy" id="gamesHint"></p>
+    <div class="games-list" id="gamesList" role="listbox" aria-label="Installed games"></div>
+    <div class="modal-foot"><span class="status-copy" id="gamesStatus"></span><button class="button ghost" data-action="scan-games">Rescan</button><button class="button ghost" data-action="close-games">Close</button></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="confirmModal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+  <div class="modal-backdrop" data-action="confirm-cancel"></div>
+  <div class="modal-card confirm-card">
+    <div class="modal-head"><div><span class="modal-kicker" id="confirmKicker">Confirm</span><h2 id="confirmTitle">Are you sure?</h2></div><button class="icon-button" data-action="confirm-cancel" aria-label="Close">✕</button></div>
+    <p class="confirm-copy" id="confirmMessage"></p>
+    <div class="modal-foot"><button class="button ghost" id="confirmCancel" data-action="confirm-cancel">Cancel</button><button class="button primary" id="confirmOk" data-action="confirm-ok">Confirm</button></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="/app.js"></script>
+</body>
+</html>

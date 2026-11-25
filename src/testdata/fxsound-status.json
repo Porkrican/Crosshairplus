@@ -1,0 +1,182 @@
+{
+  "version": "1.2.16.0",
+  "power": true,
+  "presets": {
+    "built_in": [
+      {
+        "name": "General",
+        "modified": false
+      },
+      {
+        "name": "Movies",
+        "modified": false
+      },
+      {
+        "name": "TV",
+        "modified": false
+      },
+      {
+        "name": "Transcription",
+        "modified": false
+      },
+      {
+        "name": "Music",
+        "modified": false
+      },
+      {
+        "name": "Voice",
+        "modified": false
+      },
+      {
+        "name": "Volume Boost",
+        "modified": false
+      },
+      {
+        "name": "Gaming",
+        "modified": false
+      },
+      {
+        "name": "Classic Processing",
+        "modified": false
+      },
+      {
+        "name": "Light Processing",
+        "modified": false
+      },
+      {
+        "name": "Bass Boost",
+        "modified": false
+      },
+      {
+        "name": "Streaming Video",
+        "modified": false
+      },
+      {
+        "name": "Default",
+        "modified": false
+      }
+    ],
+    "user_defined": [
+      {
+        "name": "70's",
+        "modified": false
+      },
+      {
+        "name": "80's",
+        "modified": false
+      },
+      {
+        "name": "Alternative Rock",
+        "modified": false
+      },
+      {
+        "name": "Classic Rock",
+        "modified": false
+      },
+      {
+        "name": "Classical",
+        "modified": false
+      },
+      {
+        "name": "Jazz",
+        "modified": false
+      },
+      {
+        "name": "Metal",
+        "modified": false
+      },
+      {
+        "name": "Modern Country",
+        "modified": false
+      },
+      {
+        "name": "Modern Rock",
+        "modified": false
+      },
+      {
+        "name": "Pop",
+        "modified": false
+      },
+      {
+        "name": "R&B",
+        "modified": false
+      },
+      {
+        "name": "Trap",
+        "modified": true
+      }
+    ]
+  },
+  "selected_preset": "Trap",
+  "output_devices": [
+    "Headphones (Crusher Evo)",
+    "Monitor Speakers (AMD High Definition Audio Device)"
+  ],
+  "selected_output": "Headphones (Crusher Evo)",
+  "equalizer": {
+    "num_bands": 10,
+    "master_gain": -4.0,
+    "volume_leveling": 0.0,
+    "filter_q": 2.0,
+    "balance": 0.0,
+    "bands": [
+      {
+        "index": 0,
+        "frequency": 62.5,
+        "gain": 3.5
+      },
+      {
+        "index": 1,
+        "frequency": 115.734001159668,
+        "gain": 4.0
+      },
+      {
+        "index": 2,
+        "frequency": 214.3110046386719,
+        "gain": 0.0
+      },
+      {
+        "index": 3,
+        "frequency": 396.8500061035156,
+        "gain": 0.0
+      },
+      {
+        "index": 4,
+        "frequency": 734.8670043945312,
+        "gain": 0.0
+      },
+      {
+        "index": 5,
+        "frequency": 1360.7900390625,
+        "gain": 0.0
+      },
+      {
+        "index": 6,
+        "frequency": 2519.840087890625,
+        "gain": 0.0
+      },
+      {
+        "index": 7,
+        "frequency": 4666.1201171875,
+        "gain": 0.0
+      },
+      {
+        "index": 8,
+        "frequency": 8640.48046875,
+        "gain": 0.0
+      },
+      {
+        "index": 9,
+        "frequency": 16000.0,
+        "gain": 0.0
+      }
+    ]
+  },
+  "effects": {
+    "clarity": 0.0,
+    "ambience": 4.015748023986816,
+    "surround": 4.015748023986816,
+    "dynamicboost": 1.968503952026367,
+    "bass": 1.023622035980225
+  }
+}

@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="color-scheme" content="dark">
+<title>Crosshair+</title>
+<link rel="stylesheet" href="/tray.css">
+</head>
+<body>
+<div class="tray-panel">
+  <header class="tray-head">
+    <img class="tray-icon" src="/assets/icon.png" alt="">
+    <strong class="tray-brand">Crosshair+</strong>
+  </header>
+
+  <div class="tray-modules" role="group" aria-label="Modules">
+    <button class="tray-toggle" type="button" data-module="crosshair" aria-pressed="false">
+      <span class="tray-label"><span class="tray-emoji">🎯</span><span>Aim</span></span>
+      <span class="tray-switch" aria-hidden="true"><i></i></span>
+    </button>
+    <button class="tray-toggle" type="button" data-module="display" aria-pressed="false">
+      <span class="tray-label"><span class="tray-emoji">🖥️</span><span>Display</span></span>
+      <span class="tray-switch" aria-hidden="true"><i></i></span>
+    </button>
+    <button class="tray-toggle" type="button" data-module="audio" aria-pressed="false">
+      <span class="tray-label"><span class="tray-emoji">🔊</span><span>Sound</span></span>
+      <span class="tray-switch" aria-hidden="true"><i></i></span>
+    </button>
+  </div>
+
+  <section class="tray-slots" aria-label="Slots">
+    <div class="tray-section-head"><span>⚡ Slots</span><span id="traySlotCount">0</span></div>
+    <div class="tray-slot-list" id="traySlots"></div>
+  </section>
+
+  <footer class="tray-actions">
+    <button type="button" data-action="OpenMain"><span class="tray-action-icon" aria-hidden="true">↗</span><span class="tray-action-label">Open Crosshair+</span></button>
+    <button type="button" data-action="OpenSettings"><span class="tray-action-icon" aria-hidden="true">⚙</span><span class="tray-action-label">Settings</span></button>
+    <button type="button" data-action="ExitApp"><span class="tray-action-icon" aria-hidden="true">⏻</span><span class="tray-action-label">Exit</span></button>
+  </footer>
+</div>
+<script src="/tray.js"></script>
+</body>
+</html>

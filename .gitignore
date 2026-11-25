@@ -1,0 +1,17 @@
+/target
+/.freebuff
+/.cloud-attachments
+/.vs
+/.vscode
+/*.user
+/*.suo
+*.pdb
+*.log
+*.tmp
+*.orig
+*.rej
+/Thumbs.db
+/desktop.ini
+.DS_Store
+/screenshots/audit
+/CrosshairPlus.exe

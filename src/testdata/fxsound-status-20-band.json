@@ -1,0 +1,42 @@
+{
+  "version": "1.2.16.0",
+  "power": true,
+  "selected_preset": "Crosshair+",
+  "selected_output": "Stub Headphones",
+  "equalizer": {
+    "num_bands": 20,
+    "master_gain": -3.0,
+    "volume_leveling": 0.0,
+    "filter_q": 1.0,
+    "balance": 0.0,
+    "bands": [
+      { "index": 0, "frequency": 20.000, "gain": -5.0 },
+      { "index": 1, "frequency": 28.769, "gain": -4.6 },
+      { "index": 2, "frequency": 41.383, "gain": -4.2 },
+      { "index": 3, "frequency": 59.527, "gain": -3.8 },
+      { "index": 4, "frequency": 85.627, "gain": -3.4 },
+      { "index": 5, "frequency": 123.170, "gain": -3.0 },
+      { "index": 6, "frequency": 177.173, "gain": -2.6 },
+      { "index": 7, "frequency": 254.855, "gain": -2.2 },
+      { "index": 8, "frequency": 366.596, "gain": -1.8 },
+      { "index": 9, "frequency": 527.330, "gain": -1.4 },
+      { "index": 10, "frequency": 758.538, "gain": -1.0 },
+      { "index": 11, "frequency": 1091.119, "gain": -0.6 },
+      { "index": 12, "frequency": 1569.520, "gain": -0.2 },
+      { "index": 13, "frequency": 2257.676, "gain": 0.2 },
+      { "index": 14, "frequency": 3247.553, "gain": 0.6 },
+      { "index": 15, "frequency": 4671.443, "gain": 1.0 },
+      { "index": 16, "frequency": 6719.637, "gain": 1.4 },
+      { "index": 17, "frequency": 9665.860, "gain": 1.8 },
+      { "index": 18, "frequency": 13903.856, "gain": 2.2 },
+      { "index": 19, "frequency": 20000.000, "gain": 2.6 }
+    ]
+  },
+  "effects": {
+    "clarity": 0.0,
+    "ambience": 0.0,
+    "surround": 0.0,
+    "dynamicboost": 0.0,
+    "bass": 0.0
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "version": "1.2.16.0",
+  "power": true,
+  "selected_preset": "User Preset",
+  "selected_output": "User Preset Output",
+  "equalizer": {
+    "num_bands": 10,
+    "master_gain": 0.0,
+    "volume_leveling": 0.0,
+    "filter_q": 1.0,
+    "balance": 0.0,
+    "bands": [
+      { "index": 0, "frequency": 62.5, "gain": 9.0 },
+      { "index": 1, "frequency": 115.734001159668, "gain": 8.0 },
+      { "index": 2, "frequency": 214.3110046386719, "gain": 7.0 },
+      { "index": 3, "frequency": 396.8500061035156, "gain": 6.0 },
+      { "index": 4, "frequency": 734.8670043945312, "gain": 5.0 },
+      { "index": 5, "frequency": 1360.7900390625, "gain": 4.0 },
+      { "index": 6, "frequency": 2519.840087890625, "gain": 3.0 },
+      { "index": 7, "frequency": 4666.1201171875, "gain": 2.0 },
+      { "index": 8, "frequency": 8640.48046875, "gain": 1.0 },
+      { "index": 9, "frequency": 16000.0, "gain": 0.0 }
+    ]
+  },
+  "effects": {
+    "clarity": 3.0,
+    "ambience": 2.0,
+    "surround": 1.0,
+    "dynamicboost": 4.0,
+    "bass": 5.0
+  }
+}
