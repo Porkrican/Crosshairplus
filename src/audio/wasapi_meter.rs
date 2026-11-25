@@ -62,6 +62,28 @@ pub fn enumerate_render_devices() -> Result<Vec<AudioDevice>> {
     Ok(out)
 }
 
+/// A usable peak is finite and inside the mixer's range. WASAPI can report
+/// values outside it while an endpoint settles, so both ends are clamped
+/// instead of being published as-is.
+fn clamp_peak(value: f32) -> Option<f32> {
+    if value.is_finite() {
+        Some(value.clamp(0.0, 1.0))
+    } else {
+        None
+    }
+}
+
+/// Test-only probe: the hardware tests below assert real loopback metering only
+/// where a playback endpoint exists, and the documented no-device behaviour
+/// everywhere else. CI runners have no audio hardware at all.
+#[cfg(test)]
+fn default_render_endpoint_available() -> bool {
+    enumerator()
+        .ok()
+        .map(|enumerator| unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }.is_ok())
+        .unwrap_or(false)
+}
+
 pub struct PeakMeter {
     enumerator: Option<IMMDeviceEnumerator>,
     meter: Option<IAudioMeterInformation>,
@@ -123,13 +145,11 @@ impl PeakMeter {
 
     pub fn peak(&mut self) -> Option<f32> {
         let meter = self.meter.as_ref()?;
-        match unsafe { meter.GetPeakValue() } {
-            Ok(v) if v.is_finite() => Some(v.clamp(0.0, 1.0)),
-            _ => {
-                self.stale = true;
-                None
-            }
+        let reading = unsafe { meter.GetPeakValue() }.ok().and_then(clamp_peak);
+        if reading.is_none() {
+            self.stale = true;
         }
+        reading
     }
 }
 
@@ -144,9 +164,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn peak_clamping_rejects_non_finite_values_and_bounds_the_range() {
+        assert_eq!(clamp_peak(0.0), Some(0.0));
+        assert_eq!(clamp_peak(0.25), Some(0.25));
+        assert_eq!(clamp_peak(1.0), Some(1.0));
+        assert_eq!(clamp_peak(1.5), Some(1.0), "a hot mixer reading must clamp to 1");
+        assert_eq!(clamp_peak(-0.25), Some(0.0), "a negative reading must clamp to 0");
+        assert_eq!(clamp_peak(f32::NAN), None, "NaN is not a peak");
+        assert_eq!(clamp_peak(f32::INFINITY), None, "infinity is not a peak");
+        assert_eq!(clamp_peak(f32::NEG_INFINITY), None, "-infinity is not a peak");
+    }
+
+    #[test]
     fn default_render_endpoint_exposes_loopback_meter() {
         let mut meter = PeakMeter::new();
         meter.refresh(None);
+        if !default_render_endpoint_available() {
+            // CI runners and other audio-less sessions have no render endpoint.
+            // The documented behaviour there is "no meter", never a panic.
+            assert!(!meter.is_active(), "a session without a render endpoint exposed a meter");
+            assert!(meter.peak().is_none(), "a session without a render endpoint returned a peak");
+            assert!(meter.needs_refresh(), "a device-less refresh must keep polling for a later endpoint");
+            return;
+        }
         assert!(meter.is_active(), "default render endpoint did not expose IAudioMeterInformation");
         assert!(meter.peak().is_some(), "IAudioMeterInformation::GetPeakValue returned no peak");
     }
@@ -156,6 +196,14 @@ mod tests {
         let mut meter = PeakMeter::new();
         assert!(meter.needs_refresh(), "new meter did not request its first refresh");
         meter.refresh(Some("Crosshair+ definitely missing output device"));
+        if !default_render_endpoint_available() {
+            assert!(!meter.is_active(), "the missing-device fallback invented a meter");
+            assert!(meter.peak().is_none(), "the missing-device fallback returned a peak");
+            assert!(meter.needs_refresh(), "a device-less refresh must keep polling for a later endpoint");
+            meter.refresh(None);
+            assert!(!meter.is_active(), "a no-endpoint refresh exposed a meter");
+            return;
+        }
         assert!(!meter.needs_refresh(), "refresh left the meter stale");
         assert!(meter.is_active(), "default endpoint fallback did not expose a meter");
         for _ in 0..4 {
