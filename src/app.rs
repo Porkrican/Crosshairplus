@@ -26,7 +26,7 @@ use windows::Win32::System::Registry::{
     RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow, SW_SHOWNORMAL};
 use wry::{DragDropEvent, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
 use crate::audio::{dsp_math, fxsound, AudioDevice, AudioRuntime, FxSoundStatus};
@@ -300,6 +300,9 @@ struct App {
     tray_window: Option<Window>,
     tray_webview: Option<WebView>,
     tray_anchor: Option<TrayAnchor>,
+    /// Set once the flyout has actually owned the system foreground. Until
+    /// then a focus change is the opening handshake, not a click-away.
+    tray_owns_foreground: bool,
     tray_height: f64,
     config: Config,
     /// Problems the config file had to be cleaned of on load, shown once the UI
@@ -516,6 +519,7 @@ impl App {
             tray_window: None,
             tray_webview: None,
             tray_anchor: None,
+            tray_owns_foreground: false,
             tray_height,
             config,
             startup_warnings,
@@ -611,7 +615,12 @@ impl App {
             }
             Event::WindowEvent { event, window_id, .. } => {
                 if self.tray_window.as_ref().map(|w| w.id()) == Some(window_id) {
-                    if matches!(event, WindowEvent::CloseRequested | WindowEvent::Focused(false)) {
+                    // Focus alone cannot dismiss the flyout: wry moves keyboard
+                    // focus from this top-level window into its WebView2 child
+                    // on activation, and tao reports that handoff as
+                    // Focused(false) the moment the flyout opens. poll_tray
+                    // dismisses it on a real foreground change instead.
+                    if matches!(event, WindowEvent::CloseRequested) {
                         self.hide_tray_panel();
                     }
                     return;
@@ -2134,6 +2143,33 @@ impl App {
                 }
             }
         }
+        self.poll_tray_foreground();
+    }
+
+    /// Hide the flyout when another window takes the foreground.
+    ///
+    /// Window focus is not usable here: the flyout's WebView2 child holds
+    /// keyboard focus, so the top-level window stops receiving focus events
+    /// after the page is clicked. The system foreground window still names the
+    /// flyout while its child is focused, which makes this check work for both
+    /// the opening handshake and later click-aways.
+    fn poll_tray_foreground(&mut self) {
+        let Some(window) = self.tray_window.as_ref() else { return; };
+        if !window.is_visible() {
+            self.tray_owns_foreground = false;
+            return;
+        }
+        let panel = HWND(window.hwnd() as *mut c_void);
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.0 == panel.0 {
+            self.tray_owns_foreground = true;
+            return;
+        }
+        // Windows can briefly report no foreground window during an
+        // activation change; only a real other window dismisses the flyout.
+        if self.tray_owns_foreground && !foreground.0.is_null() {
+            self.hide_tray_panel();
+        }
     }
 
     fn poll_save(&mut self) {
@@ -3039,6 +3075,7 @@ impl App {
     }
 
     fn show_tray_panel(&mut self, position: PhysicalPosition<f64>, rect: tray_icon::Rect) {
+        self.tray_owns_foreground = false;
         let Some(window) = &self.tray_window else { return };
         let height = tray_panel_height(self.config.slots.list.len());
         self.tray_height = height;
@@ -3074,6 +3111,7 @@ impl App {
             let _ = webview.set_visible(false);
         }
         self.tray_anchor = None;
+        self.tray_owns_foreground = false;
     }
 
     /// Keep the flyout exactly as tall as its rows when slots are added or
