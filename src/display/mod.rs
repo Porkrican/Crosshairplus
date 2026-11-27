@@ -2,6 +2,7 @@ pub mod curves;
 pub mod ddc;
 pub mod edid;
 pub mod panel;
+pub mod recovery;
 pub mod runtime;
 pub mod warning;
 

@@ -45,6 +45,15 @@ const HELPER_EXE_MARKERS: [&str; 14] = [
     "setup",
     "helper",
 ];
+/// Launchers, updaters and config tools that carry the game's name but are not
+/// the game itself. They stay candidates, but must lose to a name-matching game.
+const DEPRIORITIZED_EXE_MARKERS: [&str; 5] = [
+    "prelauncher",
+    "launcher",
+    "bootstrapper",
+    "updater",
+    "config",
+];
 const SKIP_DIRS: [&str; 8] = [
     "redist",
     "_commonredist",
@@ -530,8 +539,11 @@ fn exe_score(game_name: &str, exe: &Path) -> Option<i32> {
     {
         score += 10;
     }
-    if name.contains("launcher") {
-        score -= 15;
+    if DEPRIORITIZED_EXE_MARKERS.iter().any(|marker| name.contains(marker)) {
+        // A pre-launcher or updater often carries the game name and can otherwise
+        // outrank the real executable. Keep the candidate (the single-candidate
+        // path still accepts it) but put it behind a name-matching game binary.
+        score -= 40;
     }
     Some(score)
 }
@@ -751,6 +763,39 @@ mod tests {
         let mut budget = MAX_EXE_CANDIDATES;
         let exe = pick_exe("Game", &tree.0, &mut budget).expect("game exe");
         assert_eq!(exe.file_name().unwrap(), "Game.exe");
+    }
+
+    #[test]
+    fn the_real_game_beats_prelaunchers_and_updaters() {
+        let tree = TempTree::new("prelauncher");
+        tree.file("MyGame.exe");
+        tree.file("MyGameLauncher.exe");
+        tree.file("MyGamePrelauncher.exe");
+        tree.file("MyGameBootstrapper.exe");
+        tree.file("MyGameUpdater.exe");
+        tree.file("MyGameConfig.exe");
+        let mut budget = MAX_EXE_CANDIDATES;
+        let exe = pick_exe("MyGame", &tree.0, &mut budget).expect("real game exe");
+        assert_eq!(exe.file_name().unwrap(), "MyGame.exe");
+    }
+
+    #[test]
+    fn cyberpunk_game_exe_beats_redprelauncher() {
+        let tree = TempTree::new("cyberpunk");
+        tree.file("Cyberpunk2077.exe");
+        tree.file("REDprelauncher.exe");
+        let mut budget = MAX_EXE_CANDIDATES;
+        let exe = pick_exe("Cyberpunk 2077", &tree.0, &mut budget).expect("game exe");
+        assert_eq!(exe.file_name().unwrap(), "Cyberpunk2077.exe");
+    }
+
+    #[test]
+    fn a_lone_prelauncher_is_still_selectable() {
+        let tree = TempTree::new("only-prelauncher");
+        tree.file("REDprelauncher.exe");
+        let mut budget = MAX_EXE_CANDIDATES;
+        let exe = pick_exe("Cyberpunk 2077", &tree.0, &mut budget).expect("lone prelauncher fallback");
+        assert_eq!(exe.file_name().unwrap(), "REDprelauncher.exe");
     }
 
     #[test]

@@ -4,12 +4,15 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::Foundation::{CloseHandle, FILETIME};
 use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC, HDC};
-use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 use windows::Win32::UI::ColorSystem::{GetDeviceGammaRamp, SetDeviceGammaRamp};
 
 use crate::monitors::MonitorInfo;
@@ -29,11 +32,45 @@ struct SafetyRamp {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 struct SafetySnapshot {
     pid: u32,
+    /// Distinguishes two runs that Windows happened to give the same PID.
+    #[serde(default)]
+    session: u64,
+    /// Process creation time (FILETIME). A recycled PID is not this process.
+    #[serde(default)]
+    created: u64,
     ramps: Vec<SafetyRamp>,
     fx_power: bool,
     /// Preset selected before Crosshair+ switched to its managed preset.
     #[serde(default)]
     fx_preset: Option<String>,
+}
+
+fn session_marker() -> u64 {
+    static SESSION: OnceLock<u64> = OnceLock::new();
+    *SESSION.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0)
+    })
+}
+
+fn process_created(pid: u32) -> Option<u64> {
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let ok = GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user).is_ok();
+        let _ = CloseHandle(handle);
+        ok.then(|| ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64)
+    }
+}
+
+fn own_created() -> u64 {
+    static CREATED: OnceLock<u64> = OnceLock::new();
+    *CREATED.get_or_init(|| process_created(std::process::id()).unwrap_or(0))
 }
 
 fn ramps() -> &'static Mutex<Vec<(String, [u16; 768])>> {
@@ -148,6 +185,8 @@ fn snapshot_from_memory(fx_power_on: bool, fx_preset_name: Option<String>) -> Sa
     let list = ramps().lock().unwrap_or_else(|e| e.into_inner());
     SafetySnapshot {
         pid: std::process::id(),
+        session: session_marker(),
+        created: own_created(),
         ramps: list
             .iter()
             .map(|(gdi, ramp)| SafetyRamp { gdi: gdi.clone(), ramp: ramp.to_vec() })
@@ -158,9 +197,12 @@ fn snapshot_from_memory(fx_power_on: bool, fx_preset_name: Option<String>) -> Sa
 }
 
 fn recovery_owner_alive() -> bool {
-    load_snapshot_from(&recovery_path())
-        .map(|snapshot| snapshot.pid != std::process::id() && pid_alive(snapshot.pid))
-        .unwrap_or(false)
+    let Some(snapshot) = load_snapshot_from(&recovery_path()) else { return false };
+    if snapshot.pid == std::process::id() || !pid_alive(snapshot.pid) {
+        return false;
+    }
+    // Legacy snapshots have no creation time; a live PID is all we can check.
+    snapshot.created == 0 || process_created(snapshot.pid) == Some(snapshot.created)
 }
 
 fn run_fx_power(path: &Path, power: bool) -> bool {
@@ -224,14 +266,25 @@ pub fn recover_pending() -> bool {
         return false;
     };
     if snapshot.pid == std::process::id() {
-        return false;
-    }
-    if pid_alive(snapshot.pid) {
+        if snapshot.session == session_marker() {
+            return false;
+        }
+        // A recycled PID is ours now; the previous session is dead, so its
+        // snapshot is a leftover and must be restored and cleared.
+        crate::logging::log("safety: clearing a same-pid snapshot from an earlier session");
+    } else if pid_alive(snapshot.pid)
+        && (snapshot.created == 0 || process_created(snapshot.pid) == Some(snapshot.created))
+    {
         crate::logging::log(&format!(
             "safety: recovery snapshot belongs to live pid {}; leaving it untouched",
             snapshot.pid
         ));
         return false;
+    } else if pid_alive(snapshot.pid) {
+        crate::logging::log(&format!(
+            "safety: pid {} was recycled; restoring the stale baseline",
+            snapshot.pid
+        ));
     }
     let mut restored = 0usize;
     let mut failed = 0usize;
@@ -301,6 +354,69 @@ pub fn restore_display() -> bool {
     ok
 }
 
+/// Panic-path restore: every shared lock is `try_lock`, so a panic raised
+/// while `safety` already holds one cannot deadlock the dialog.
+pub fn restore_all_on_panic() {
+    if RESTORED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut display_ok = true;
+    match ramps().try_lock() {
+        Ok(list) => {
+            for (gdi, ramp) in list.iter() {
+                if !write(gdi, ramp) {
+                    display_ok = false;
+                }
+            }
+        }
+        Err(_) => {
+            crate::logging::log("safety: panic restore skipped display ramps; the lock was held");
+            display_ok = false;
+        }
+    }
+    let fx_ok = match (fx_power().try_lock(), fx_preset().try_lock()) {
+        (Ok(power), Ok(preset)) => {
+            let power_on = *power;
+            let preset_name = preset.clone();
+            drop(preset);
+            drop(power);
+            // The CLI can take seconds; the panic dialog must not wait on it.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(set_fx_baseline(power_on, preset_name.as_deref()));
+            });
+            rx.recv_timeout(Duration::from_millis(1000)).unwrap_or(false)
+        }
+        _ => {
+            crate::logging::log("safety: panic restore skipped FxSound; the lock was held");
+            false
+        }
+    };
+    crate::logging::log(&format!(
+        "safety: panic restore finished display={display_ok} fx={fx_ok}"
+    ));
+}
+
+/// Session end: gamma ramps are cheap and always run; the FxSound CLI is
+/// best-effort and capped so Windows never waits seconds on shutdown.
+pub fn restore_for_shutdown() {
+    if RESTORED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let display_ok = restore_display();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(restore_fx_blocking());
+    });
+    let fx_ok = rx.recv_timeout(Duration::from_millis(1000)).unwrap_or(false);
+    // Whatever happened, the normal-exit path must not try again and block
+    // shutdown for the full CLI timeout.
+    FX_RESTORED.store(true, Ordering::SeqCst);
+    crate::logging::log(&format!(
+        "safety: shutdown restore display={display_ok} fx={fx_ok}"
+    ));
+}
+
 pub fn restore_all_blocking() {
     if RESTORED.swap(true, Ordering::SeqCst) {
         return;
@@ -357,6 +473,8 @@ mod tests {
         ));
         let snapshot = SafetySnapshot {
             pid: std::process::id(),
+            session: session_marker(),
+            created: own_created(),
             ramps: vec![SafetyRamp { gdi: r"\\.\DISPLAY1".into(), ramp: vec![1; 768] }],
             fx_power: true,
             fx_preset: Some("Trap".into()),
@@ -386,5 +504,12 @@ mod tests {
     #[test]
     fn current_process_is_alive() {
         assert!(pid_alive(std::process::id()));
+    }
+
+    #[test]
+    fn process_creation_time_distinguishes_a_recycled_pid() {
+        let created = process_created(std::process::id()).expect("our own creation time is queryable");
+        assert_eq!(created, own_created());
+        assert_ne!(created, created ^ 1);
     }
 }

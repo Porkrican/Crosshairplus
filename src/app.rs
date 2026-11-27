@@ -18,15 +18,18 @@ use raw_window_handle::{
     Win32WindowHandle, WindowHandle, WindowsDisplayHandle,
 };
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Foundation::{HWND, POINT, ERROR_SUCCESS};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Registry::{
-    RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER,
+    RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    RRF_RT_REG_BINARY, RRF_RT_REG_SZ,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow, SW_SHOWNORMAL};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, MessageBoxW, SetForegroundWindow, MB_ICONERROR, MB_OK, SW_SHOWNORMAL,
+};
 use wry::{DragDropEvent, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
 use crate::audio::{dsp_math, fxsound, AudioDevice, AudioRuntime, FxSoundStatus};
@@ -54,7 +57,14 @@ pub enum AppEvent {
     SoundMeter { peak: f32 },
     DropFile(PathBuf),
     Ready,
+    /// A duplicate launch asked the running copy to surface its main window.
+    ShowMain,
+    /// Full monitor probe (DDC/WMI) finished on a worker thread.
+    MonitorsRefreshed(Vec<MonitorInfo>),
+    /// Render endpoint enumeration finished on a worker thread.
+    AudioDevices(Vec<AudioDevice>),
     VerifyReport(String),
+    VerifyOverlay(String),
     FxVerifyReport(String),
     StressReport(String),
     PreviewReady { tick: u64, next_ms: Option<u64>, render_ms: u64 },
@@ -237,6 +247,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = EventLoopBuilder::<AppEvent>::with_user_event();
     let event_loop = builder.build();
     let proxy = event_loop.create_proxy();
+    if let Some(handle) = _instance.as_ref().and_then(|guard| guard.show_event()) {
+        // A duplicate launch signals this event instead of searching for a
+        // window title, so a flyout with a similar title cannot be picked.
+        let proxy = proxy.clone();
+        std::thread::spawn(move || loop {
+            use windows::Win32::Foundation::HANDLE;
+            use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+            let wait = unsafe { WaitForSingleObject(HANDLE(handle as *mut c_void), INFINITE) };
+            if wait.0 != 0 {
+                break;
+            }
+            let _ = proxy.send_event(AppEvent::ShowMain);
+        });
+    }
     let mut app = App::new(proxy, capture_mode, verify_mode, fx_verify_mode, interaction_mode, stress_mode, fx_verify_live)?;
     event_loop.run(move |event, target, control_flow| {
         app.handle(event, target, control_flow);
@@ -309,6 +333,8 @@ struct App {
     /// is ready so a vanished curve is explained instead of only logged.
     startup_warnings: Vec<String>,
     monitors: Vec<MonitorInfo>,
+    monitors_refresh_due: Option<Instant>,
+    monitors_refreshing: bool,
     display: DisplayRuntime,
     audio: AudioRuntime,
     overlay: OverlayHandle,
@@ -347,9 +373,17 @@ struct App {
     /// A manual Cycle must not be undone by the one-second foreground watcher
     /// until the user actually switches to another application.
     auto_suppressed_for: Option<String>,
+    /// Consecutive watcher ticks with the active slot's target gone. Two ticks
+    /// keep a splash-screen relaunch from reverting the slot.
+    slot_absence: slots::SlotAbsence,
     /// True between CompareDisplay(true) and CompareDisplay(false). Suspend and
     /// shutdown clear it so a lost pointer can never leave identity ramps on.
     compare_active: bool,
+    /// True between CompareSound(true) and CompareSound(false). Suspend and
+    /// shutdown put the saved curve back so a lost pointer never leaves flat EQ.
+    audio_compare_active: bool,
+    /// Per-monitor HDR/ACM block state, so a return to SDR re-applies the LUT.
+    display_blocks: crate::display::recovery::BlockedDisplays,
     stress_toasts: u64,
     stress_toast_at: Instant,
     watchdog: UiWatchdog,
@@ -370,6 +404,13 @@ struct App {
     verify_started: bool,
     verify_deadline: Option<Instant>,
     verify_done: bool,
+    verify_image_seeded: bool,
+    verify_image_armed: Arc<AtomicBool>,
+    verify_image_poll_at: Option<Instant>,
+    verify_image_deleted: bool,
+    verify_image_steps: Vec<&'static str>,
+    verify_overlay_last_requests: u64,
+    verify_overlay_checks: Vec<serde_json::Value>,
     fx_verify_live: bool,
     fx_verify_started: bool,
     fx_verify_deadline: Option<Instant>,
@@ -389,6 +430,7 @@ struct App {
     selftest_started_at: Option<Instant>,
     layout_resized: bool,
     layout_probe_done: bool,
+    recent_probe_logged: bool,
     picker_open: bool,
     backup_drop_armed: Arc<AtomicBool>,
     pending_backup: Option<PathBuf>,
@@ -403,7 +445,7 @@ impl App {
         if !modes.automated() {
             backup_config();
         }
-        let (mut config, startup_warnings) = if capture_mode {
+        let (mut config, mut startup_warnings) = if capture_mode {
             (capture_config(), Vec::new())
         } else {
             Config::load_reporting()
@@ -413,6 +455,39 @@ impl App {
         if capture_mode {
             config.normalize();
         }
+        // The preset verifier also drives one real failed image selection. Seed
+        // a live file and persist that state now; the page arms before the
+        // harness deletes it, so the verifier can prove the failure cleanup
+        // persisted over the original image (not a later flush).
+        let verify_image_seeded = if verify_mode {
+            let live = config::crosshairs_dir().join("live-probe.png");
+            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
+            // The page uses this file for the successful use/remove/active-delete
+            // paths; it is stored but not live at startup.
+            if let Err(err) = std::fs::copy(&source, config::crosshairs_dir().join("use-probe.png")) {
+                crate::logging::log(&format!("verify: could not seed the use-probe image: {err}"));
+            }
+            match std::fs::copy(&source, &live) {
+                Ok(_) => {
+                    config.crosshair.image = Some(live.to_string_lossy().to_string());
+                    config.crosshair.image_name = Some("live-probe.png".into());
+                    config.crosshair.gif_playing = false;
+                    match config.save() {
+                        Ok(()) => true,
+                        Err(err) => {
+                            crate::logging::log(&format!("verify: could not persist the seeded live image: {err}"));
+                            false
+                        }
+                    }
+                }
+                Err(err) => {
+                    crate::logging::log(&format!("verify: could not seed the live image: {err}"));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if stress_mode {
             // A real animated asset keeps the preview pump and overlay drawing
             // for the whole run, while the sandbox config keeps it local.
@@ -439,7 +514,9 @@ impl App {
                 crate::logging::log(&format!("slots: could not persist crash recovery: {err}"));
             }
         }
-        let monitors = monitors::refresh();
+        // Startup uses the fast enumeration only: DDC/WMI probes run after the
+        // first paint on a worker (see `init_window`).
+        let monitors = monitors::quick();
         for monitor in &monitors {
             crate::logging::log(&format!(
                 "monitor: id={} gdi={} name={} {}x{}+{},{} dpi={} scale={:.2} backlight={}",
@@ -452,11 +529,8 @@ impl App {
                 monitor.y,
                 monitor.dpi,
                 monitor.scale,
-                monitor.backlight_supported
+                if monitor.backlight_supported { "true" } else { "deferred" }
             ));
-        }
-        if modes.live_system() {
-            fxsound::prime_status();
         }
         let audio = AudioRuntime::start(proxy.clone());
         let fx = audio.status();
@@ -475,19 +549,18 @@ impl App {
         let overlay = OverlayHandle::start(proxy.clone());
         let preview_cache = Arc::new(Mutex::new(PreviewCache::default()));
         let preview = PreviewWorker::start(proxy.clone(), preview_cache.clone());
-        let audio_devices = AudioRuntime::devices();
-        crate::logging::log(&format!(
-            "audio: {} render device(s): {}",
-            audio_devices.len(),
-            audio_devices.iter().map(|device| device.name.as_str()).collect::<Vec<_>>().join(", ")
-        ));
+        // Endpoint enumeration blocks on WASAPI; it starts after the window is
+        // visible and arrives as `AppEvent::AudioDevices`.
+        let audio_devices: Vec<AudioDevice> = Vec::new();
         let selected_slot = config.slots.active.clone().or_else(|| config.slots.list.first().map(|slot| slot.id.clone()));
         if let Some(device) = config.audio.device.clone() {
             if let Some(found) = audio_devices.iter().find(|d| d.id == device || d.name == device) {
                 config.audio.device = Some(found.name.clone());
             }
         }
-        apply_run_key_checked(&config.settings, modes);
+        if let Some(warning) = apply_run_key_checked(&config.settings, modes) {
+            startup_warnings.push(warning);
+        }
         if interaction_mode {
             crate::logging::log("interaction test: OS/FxSound/registry side effects disabled");
         }
@@ -510,7 +583,7 @@ impl App {
             }
         };
         let tray_height = tray_panel_height(config.slots.list.len());
-        let mut app = Self {
+        let app = Self {
             proxy,
             window: None,
             webview: None,
@@ -524,6 +597,8 @@ impl App {
             config,
             startup_warnings,
             monitors,
+            monitors_refresh_due: None,
+            monitors_refreshing: false,
             display,
             audio,
             overlay,
@@ -555,7 +630,10 @@ impl App {
             pending_audio_reconcile: false,
             last_overlay_log: None,
             auto_suppressed_for: None,
+            slot_absence: slots::SlotAbsence::default(),
             compare_active: false,
+            audio_compare_active: false,
+            display_blocks: crate::display::recovery::BlockedDisplays::default(),
             stress_toasts: 0,
             stress_toast_at: Instant::now(),
             watchdog: UiWatchdog::start(),
@@ -577,6 +655,13 @@ impl App {
             verify_started: false,
             verify_deadline: None,
             verify_done: false,
+            verify_image_seeded,
+            verify_image_armed: Arc::new(AtomicBool::new(false)),
+            verify_image_poll_at: None,
+            verify_image_deleted: false,
+            verify_image_steps: Vec::new(),
+            verify_overlay_last_requests: 0,
+            verify_overlay_checks: Vec::new(),
             fx_verify_started: false,
             fx_verify_deadline: None,
             fx_verify_done: false,
@@ -593,6 +678,7 @@ impl App {
             selftest_started_at: None,
             layout_resized: false,
             layout_probe_done: false,
+            recent_probe_logged: false,
             picker_open: false,
             backup_drop_armed: Arc::new(AtomicBool::new(false)),
             pending_backup: None,
@@ -600,8 +686,6 @@ impl App {
         if stress_mode {
             crate::logging::log("stress: sandbox harness; tray, hotkeys and OS side effects are disabled");
         }
-        app.mark_dirty();
-        app.save_now();
         Ok(app)
     }
 
@@ -610,6 +694,8 @@ impl App {
             Event::NewEvents(StartCause::Init) => {
                 if let Err(err) = self.init_window(target) {
                     crate::logging::log(&format!("window init failed: {err}"));
+                    self.exit_code = 1;
+                    show_startup_error(&err.to_string());
                     self.exit_requested = true;
                 }
             }
@@ -657,6 +743,9 @@ impl App {
     fn init_window(&mut self, target: &EventLoopWindowTarget<AppEvent>) -> Result<(), Box<dyn std::error::Error>> {
         if self.window.is_some() {
             return Ok(());
+        }
+        if let Some(err) = webview2_preflight_error() {
+            return Err(err.into());
         }
         let icon = scene::icon_rgba(64)
             .ok()
@@ -729,6 +818,10 @@ impl App {
                     let _ = proxy_ipc.send_event(AppEvent::VerifyReport(body.to_string()));
                     return;
                 }
+                if verify_mode && ipc::is_verify_overlay(body) {
+                    let _ = proxy_ipc.send_event(AppEvent::VerifyOverlay(body.to_string()));
+                    return;
+                }
                 if fx_verify_mode && ipc::is_fx_verify_report(body) {
                     let _ = proxy_ipc.send_event(AppEvent::FxVerifyReport(body.to_string()));
                     return;
@@ -760,7 +853,7 @@ impl App {
         // WebView2 is forced to device scale 1, so the tray's CSS pixels are
         // physical pixels; size the window in the same units as the page.
         let tray_window = WindowBuilder::new()
-            .with_title("Crosshair+")
+            .with_title("Crosshair+ tray")
             .with_inner_size(PhysicalSize::new(
                 TRAY_PANEL_WIDTH as u32,
                 tray_panel_height(self.config.slots.list.len()) as u32,
@@ -803,7 +896,34 @@ impl App {
         self.tray_webview = Some(tray_webview);
         self._web_context = Some(web_context);
         self.sync_overlay();
+        self.start_startup_probes();
         Ok(())
+    }
+
+    /// Runs the expensive probes after the window exists, so neither the first
+    /// paint nor the event loop waits on a display driver or WASAPI.
+    fn start_startup_probes(&mut self) {
+        let proxy = self.proxy.clone();
+        let probes = self.backlight.handle();
+        std::thread::spawn(move || {
+            // WMI (the laptop fallback) needs COM on this thread. DDC reads are
+            // requested from the BacklightPacer worker, which owns that thread.
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+            let monitors = monitors::refresh(&probes);
+            if com {
+                unsafe { CoUninitialize() };
+            }
+            let _ = proxy.send_event(AppEvent::MonitorsRefreshed(monitors));
+        });
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let devices = AudioRuntime::devices();
+            let _ = proxy.send_event(AppEvent::AudioDevices(devices));
+        });
+        if self.modes().live_system() {
+            // `--status` can take seconds; the audio worker owns it now.
+            self.audio.refresh(true);
+        }
     }
 
     fn pump(&mut self, control_flow: &mut ControlFlow) {
@@ -816,6 +936,8 @@ impl App {
         self.watchdog.stage("pump");
         self.poll_tray();
         self.poll_watchers();
+        self.poll_monitor_refresh();
+        self.poll_backlight_probes();
         self.poll_preview();
         self.poll_save();
         self.poll_capture();
@@ -842,6 +964,22 @@ impl App {
     fn on_app_event(&mut self, event: AppEvent) {
         self.watchdog.beat();
         match event {
+            AppEvent::ShowMain => self.show_window(),
+            AppEvent::MonitorsRefreshed(monitors) => {
+                self.monitors_refreshing = false;
+                self.apply_monitor_refresh(monitors);
+            }
+            AppEvent::AudioDevices(devices) => {
+                self.audio_devices = devices;
+                crate::logging::log(&format!(
+                    "audio: {} render device(s): {}",
+                    self.audio_devices.len(),
+                    self.audio_devices.iter().map(|device| device.name.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+                if self.ui_ready {
+                    self.emit_full_state();
+                }
+            }
             AppEvent::Command(command) => {
                 let stage = format!("command:{}", command.name());
                 self.watchdog.stage(&stage);
@@ -1004,6 +1142,7 @@ impl App {
                 }
             }
             AppEvent::VerifyReport(report) => self.finish_verify(&report),
+            AppEvent::VerifyOverlay(report) => self.accept_verify_overlay(&report),
             AppEvent::Ready => {
                 if !self.ui_ready {
                     self.ui_ready = true;
@@ -1090,25 +1229,36 @@ impl App {
             OverlayEvent::HotkeyConflict { slot_id, key, owner } => {
                 self.emit(IpcEvent::HotkeyConflict { slot_id, key, owner });
             }
-            OverlayEvent::DisplayChanged => {
-                self.refresh_monitors();
-                self.apply_display();
+            OverlayEvent::HotkeyResolved { slot_id, key } => {
+                self.emit(IpcEvent::HotkeyResolved { slot_id, key });
             }
-            OverlayEvent::ForegroundChanged => self.check_slots(),
+            OverlayEvent::DisplayChanged => self.queue_monitor_refresh(),
+            OverlayEvent::ForegroundChanged => {
+                // A foreground change is also a cheap chance to retry hotkeys
+                // that another application briefly owned.
+                self.sync_overlay();
+                self.check_slots();
+            }
             OverlayEvent::PowerSuspend => {
                 self.compare_active = false;
                 if !self.sandbox_blocked("display restore") {
                     self.display.restore_blocking();
                 }
+                if self.audio_compare_active {
+                    self.audio_compare_active = false;
+                    if !self.sandbox_blocked("audio compare restore") {
+                        self.audio.apply(self.config.audio.clone());
+                    }
+                }
             }
             OverlayEvent::PowerResume | OverlayEvent::SessionUnlock => {
-                self.refresh_monitors();
+                self.queue_monitor_refresh();
                 self.apply_display();
                 self.sync_overlay();
             }
             OverlayEvent::EndSession => {
                 if !self.sandbox_blocked("display restore") {
-                    safety::restore_all_blocking();
+                    safety::restore_for_shutdown();
                 }
                 self.exit_requested = true;
             }
@@ -1156,12 +1306,35 @@ impl App {
             }
             Command::ToggleMaster { module } => self.toggle_module(&module),
             Command::UpdateCrosshair { mut crosshair } => {
+                // Honor the preset the page applied; a manual edit arrives with no
+                // preset id and clears it exactly like display and audio do.
                 crosshair.normalize();
+                crosshair.active_preset = crosshair
+                    .active_preset
+                    .as_deref()
+                    .and_then(|id| self.config.find_crosshair_preset(id))
+                    .map(|preset| preset.id.clone());
+                // An image-mode preset whose file vanished must not replace the
+                // live image with a dead path; keep the current image block and
+                // tell the page what was actually kept.
+                let preset = crosshair
+                    .active_preset
+                    .as_deref()
+                    .and_then(|id| self.config.find_crosshair_preset(id));
+                let missing_image =
+                    config::guard_preset_image(&self.config.crosshair, &mut crosshair, preset.as_ref());
                 self.config.crosshair = crosshair;
-                self.config.crosshair.active_preset = None;
                 self.mark_dirty();
                 self.sync_overlay();
                 self.update_preview();
+                if let Some(name) = missing_image {
+                    self.emit_full_state();
+                    self.emit(IpcEvent::DiagnosticBanner {
+                        code: "image".into(),
+                        message: config::missing_preset_image_message(&name),
+                        recoverable: true,
+                    });
+                }
             }
             Command::UpdateDisplay { mut display } => {
                 display.normalize();
@@ -1189,13 +1362,31 @@ impl App {
                     self.apply_display();
                 }
             }
+            Command::CompareSound { active } => {
+                // Temporary live effect, like CompareDisplay: capture and every
+                // sandboxed harness leave FxSound completely untouched.
+                if !self.modes().live_system() {
+                    crate::logging::log("sandbox: sound compare skipped; FxSound untouched");
+                } else if active {
+                    if !self.config.audio.enabled {
+                        crate::logging::log("audio: compare ignored while Sound is off");
+                    } else if !self.audio_compare_active {
+                        self.audio_compare_active = true;
+                        self.audio.apply(dsp_math::flat_compare(&self.config.audio));
+                        crate::logging::log("audio: compare applied a flat curve with power kept on");
+                    }
+                } else {
+                    self.audio_compare_active = false;
+                    self.apply_audio();
+                }
+            }
             Command::UpdateSound { mut audio } => {
                 audio.normalize();
                 self.config.audio = audio;
                 self.mark_dirty();
                 self.apply_audio();
             }
-            Command::SavePreset { module, name } => self.save_preset(&module, &name),
+            Command::SavePreset { module, name, image_mode } => self.save_preset(&module, &name, image_mode),
             Command::DeletePreset { module, id } => self.delete_preset(&module, &id),
             Command::AssignHotkey { slot_id, hotkey } => {
                 let clean = hotkey.trim();
@@ -1292,11 +1483,61 @@ impl App {
                     self.browse_image();
                 }
             }
+            Command::RefreshRecentImages => {
+                self.emit(IpcEvent::RecentImages { images: config::recent_crosshair_images() });
+            }
+            Command::UseStoredImage { name } => {
+                match config::apply_stored_image(&mut self.config.crosshair, &name) {
+                    Ok(()) => {
+                        self.image_changed();
+                        self.save_now();
+                        self.emit_full_state();
+                        self.emit(IpcEvent::StoredImageResult { name, ok: true });
+                    }
+                    Err(message) => {
+                        // A failed pick must not leave its dead path live. The
+                        // refresh below also recomputes the Recent list so the
+                        // vanished file stops being selectable.
+                        self.drop_vanished_live_image(&name);
+                        self.emit_full_state();
+                        self.emit(IpcEvent::StoredImageResult { name, ok: false });
+                        self.emit(IpcEvent::DiagnosticBanner {
+                            code: "image".into(),
+                            message,
+                            recoverable: true,
+                        });
+                    }
+                }
+            }
+            Command::DeleteStoredImage { name } => {
+                match config::delete_stored_image(&mut self.config, &name) {
+                    Ok(was_active) => {
+                        if was_active {
+                            self.image_changed();
+                        } else {
+                            self.mark_dirty();
+                        }
+                        self.save_now();
+                        self.emit_full_state();
+                    }
+                    Err(message) => {
+                        // Deleting a file that already vanished outside the app
+                        // must refresh the Recent list and drop the live image
+                        // when it was that missing file.
+                        self.drop_vanished_live_image(&name);
+                        self.emit_full_state();
+                        self.emit(IpcEvent::DiagnosticBanner {
+                            code: "image".into(),
+                            message,
+                            recoverable: true,
+                        });
+                    }
+                }
+            }
             Command::RemoveImage => {
                 self.config.crosshair.image = None;
                 self.config.crosshair.image_name = None;
-                self.mark_dirty();
-                self.update_preview();
+                self.image_changed();
                 self.emit_full_state();
             }
             Command::ImportEq { path, text, name } => self.import_eq(path, text, name),
@@ -1390,7 +1631,9 @@ impl App {
                     self.emit(IpcEvent::DiagnosticBanner { code: "settings".into(), message: err, recoverable: true });
                     return;
                 }
-                apply_run_key_checked(&self.config.settings, self.modes());
+                if let Some(warning) = apply_run_key_checked(&self.config.settings, self.modes()) {
+                    self.emit(IpcEvent::DiagnosticBanner { code: "settings".into(), message: warning, recoverable: true });
+                }
                 self.mark_dirty();
                 self.sync_overlay();
                 self.update_meter_state();
@@ -1527,6 +1770,12 @@ impl App {
                 ));
                 self.selected_slot = None;
                 apply_run_key_checked(&self.config.settings, self.modes());
+                // Drop the last FxSound snapshot so the Sound tab reports the
+                // fresh install instead of the reset session's cached status.
+                if self.modes().live_system() {
+                    self.audio.refresh(true);
+                }
+                self.fx = fxsound::status();
                 self.mark_dirty();
                 self.sync_overlay();
                 self.emit_neutral_lut();
@@ -1706,8 +1955,8 @@ impl App {
             self.selected_slot = Some(id.clone());
         }
         let toggle = if was_active { None } else { target.as_deref() };
-        let changed = match slots::switch_slot(&mut self.config, toggle, None) {
-            Ok(changed) => changed,
+        let (changed, missing_image) = match slots::switch_slot(&mut self.config, toggle, None) {
+            Ok(result) => result,
             Err(err) => {
                 self.emit(IpcEvent::DiagnosticBanner { code: "slot".into(), message: err, recoverable: true });
                 return;
@@ -1744,6 +1993,13 @@ impl App {
         let state_started = Instant::now();
         self.emit_full_state();
         let state_ms = state_started.elapsed().as_millis();
+        if let Some(name) = missing_image {
+            self.emit(IpcEvent::DiagnosticBanner {
+                code: "image".into(),
+                message: config::missing_preset_image_message(&name),
+                recoverable: true,
+            });
+        }
         self.watchdog.stage("idle");
         crate::logging::log(&format!(
             "slots: switch target={} active={:?} changed={} saved={} save={}ms display+audio={}ms overlay={}ms preview={}ms state={}ms total={}ms",
@@ -1907,14 +2163,7 @@ impl App {
         // Apply on the display worker. The UI must never wait for a display
         // driver or DDC read-back; the outcome arrives as an event.
         self.display.apply(&self.monitors, &config);
-        let backlight = self.config.display.backlight.clone();
-        for (id, percent) in backlight {
-            if let Some(monitor) = self.monitors.iter().find(|m| m.id == id) {
-                if monitor.backlight_supported {
-                    self.backlight.set(monitor.gdi.clone(), percent);
-                }
-            }
-        }
+        self.apply_backlight();
         self.watchdog.stage("idle");
     }
 
@@ -1960,7 +2209,7 @@ impl App {
     }
 
     fn sync_overlay(&mut self) {
-        if !self.modes().live_system() && !self.interaction_mode && !self.stress_mode {
+        if !self.modes().live_system() && !self.interaction_mode && !self.stress_mode && !self.verify_mode {
             return;
         }
         let monitor = monitors::find(&self.monitors, self.config.crosshair.monitor.as_deref());
@@ -1982,12 +2231,14 @@ impl App {
                 hotkeys.len()
             ));
         }
-        let input = OverlayInput {
-            config: self.config.crosshair.clone(),
-            rect: Some((monitor.x, monitor.y, monitor.width, monitor.height)),
-            hotkeys,
-            monitor_label: monitor.name.clone(),
+        // A verify run is sandboxed and must not create a desktop overlay, but
+        // its image step still needs to prove the update reached this handle.
+        let rect = if self.verify_mode {
+            None
+        } else {
+            Some((monitor.x, monitor.y, monitor.width, monitor.height))
         };
+        let input = overlay_input(&self.config.crosshair, rect, hotkeys, monitor.name.clone());
         self.overlay.update(input);
     }
 
@@ -2056,11 +2307,120 @@ impl App {
         crate::logging::log(&preview_cost_line(elapsed, &previous, &current));
     }
 
-    fn refresh_monitors(&mut self) {
-        self.monitors = monitors::refresh();
-        self.display.ensure_baselines(&self.monitors);
-        crate::logging::log(&format!("monitors: updated count={}", self.monitors.len()));
+    /// Debounce display-change bursts and probe on a worker. DDC/WMI reads can
+    /// take seconds and must never run on the UI thread.
+    fn queue_monitor_refresh(&mut self) {
+        self.monitors_refresh_due = Some(Instant::now() + Duration::from_millis(250));
+    }
+
+    fn poll_monitor_refresh(&mut self) {
+        if self.monitors_refreshing {
+            return;
+        }
+        let Some(due) = self.monitors_refresh_due else { return };
+        if Instant::now() < due {
+            return;
+        }
+        self.monitors_refresh_due = None;
+        self.monitors_refreshing = true;
+        let proxy = self.proxy.clone();
+        let probes = self.backlight.handle();
+        std::thread::spawn(move || {
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+            let monitors = monitors::refresh(&probes);
+            if com {
+                unsafe { CoUninitialize() };
+            }
+            let _ = proxy.send_event(AppEvent::MonitorsRefreshed(monitors));
+        });
+    }
+
+    fn apply_backlight(&mut self) {
+        let backlight = self.config.display.backlight.clone();
+        for (id, percent) in backlight {
+            if let Some(monitor) = self.monitors.iter().find(|m| m.id == id && m.backlight_supported) {
+                self.backlight.set(monitor.gdi.clone(), percent);
+            }
+        }
+    }
+
+    /// Probe replies arrive from the pacer thread; drain them without blocking
+    /// the UI and publish the monitor state once per batch. The first update
+    /// after a display change can therefore say `false` until the reply lands.
+    fn poll_backlight_probes(&mut self) {
+        let mut received = false;
+        while let Some((gdi, value)) = self.backlight.poll() {
+            received = true;
+            crate::logging::log(&format!(
+                "monitors: backlight {}={}",
+                gdi,
+                value.map(|v| format!("{v}%")).unwrap_or_else(|| "unsupported".to_string())
+            ));
+            if let Some(monitor) = self.monitors.iter_mut().find(|m| m.gdi.eq_ignore_ascii_case(&gdi)) {
+                monitor.backlight_supported = value.is_some();
+                monitor.backlight = value;
+            }
+        }
+        if !received {
+            return;
+        }
+        let backlight = self
+            .monitors
+            .iter()
+            .map(|monitor| format!("{}={}", monitor.gdi, monitor.backlight_supported))
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::logging::log(&format!("monitors: updated count={} backlight={backlight}", self.monitors.len()));
         self.emit(IpcEvent::MonitorsUpdated { monitors: self.monitors.clone() });
+        self.apply_backlight();
+    }
+
+    fn apply_monitor_refresh(&mut self, monitors: Vec<MonitorInfo>) {
+        self.monitors = monitors;
+        // A probe reply can land between the worker's cache read and this
+        // event. Re-check the cache so that result is never overwritten by a
+        // stale `false` from the refresh it raced.
+        let probes = self.backlight.handle();
+        for monitor in &mut self.monitors {
+            if !monitor.backlight_supported {
+                if let Some(Some(value)) = probes.probe(&monitor.gdi) {
+                    monitor.backlight_supported = true;
+                    monitor.backlight = Some(value);
+                }
+            }
+        }
+        self.display.ensure_baselines(&self.monitors);
+        let released = self.display_blocks.observe(&self.monitors);
+        if crate::display::recovery::should_reapply(
+            self.config.display.enabled,
+            self.compare_active,
+            &released,
+        ) {
+            crate::logging::log(&format!(
+                "display: HDR/ACM cleared on {}; re-applying the active LUT",
+                released.join(", ")
+            ));
+        }
+        let backlight = self
+            .monitors
+            .iter()
+            .map(|monitor| {
+                format!(
+                    "{}={}",
+                    monitor.gdi,
+                    if monitor.backlight_supported { "true" } else { "pending" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        crate::logging::log(&format!("monitors: updated count={} backlight={backlight}", self.monitors.len()));
+        self.emit(IpcEvent::MonitorsUpdated { monitors: self.monitors.clone() });
+        if self.compare_active {
+            // Hold to Compare owns the ramps; release re-applies them.
+            crate::logging::log("display: monitor refresh during compare; keeping identity ramps until release");
+        } else {
+            self.apply_display();
+        }
         self.sync_overlay();
     }
 
@@ -2094,7 +2454,7 @@ impl App {
     }
 
     fn check_slots(&mut self) {
-        if !self.modes().live_system() || !self.config.settings.auto_revert_slots {
+        if !self.modes().live_system() {
             return;
         }
         let foreground = slots::current_foreground_app();
@@ -2107,20 +2467,26 @@ impl App {
             }
             self.auto_suppressed_for = None;
         }
-        if slots::active_target_stopped(&self.config) {
-            if slots::deactivate_slot(&mut self.config) {
-                self.mark_dirty();
-                self.save_now();
-                self.apply_display();
-                self.apply_audio();
-                self.sync_overlay();
-                self.update_preview();
-                self.emit_full_state();
+        // Reverting on focus loss/game exit is the only behaviour the setting
+        // controls; a targeted slot always activates when its game is focused.
+        if self.config.settings.auto_revert_slots && slots::active_target_stopped(&self.config) {
+            if self.slot_absence.observe(self.config.slots.active.as_deref()) {
+                if slots::deactivate_slot(&mut self.config) {
+                    self.mark_dirty();
+                    self.save_now();
+                    self.apply_display();
+                    self.apply_audio();
+                    self.sync_overlay();
+                    self.update_preview();
+                    self.emit_full_state();
+                }
+                self.slot_absence.reset();
             }
             return;
         }
+        self.slot_absence.reset();
         if let Some(app) = foreground {
-            if let Some(id) = slots::auto_activate_for(&self.config, Some(&app.exe)) {
+            if let Some(id) = slots::auto_activate_for_app(&self.config, &app) {
                 self.switch_slot(Some(&id), None);
                 if self.config.slots.active.as_deref() == Some(id.as_str()) {
                     let text = self.slot_toast_text(&id);
@@ -2178,6 +2544,24 @@ impl App {
         }
     }
 
+    /// Seed the sandbox crosshairs folder for the Recent-menu probe. Only one
+    /// image is written; the page also injects a stale name that is absent from
+    /// disk, simulating an external delete the cached list cannot know about.
+    fn seed_recent_probe_images(&self) {
+        let dir = config::crosshairs_dir();
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            crate::logging::log(&format!("capture recent: cannot create {}: {err}", dir.display()));
+            return;
+        }
+        // A previous probe run may have left the stale name behind.
+        let _ = std::fs::remove_file(dir.join("recent-dead.webp"));
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/test.webp");
+        match std::fs::copy(&source, dir.join("recent-alive.webp")) {
+            Ok(_) => crate::logging::log("capture recent: seeded recent-alive.webp"),
+            Err(err) => crate::logging::log(&format!("capture recent: cannot seed recent-alive.webp: {err}")),
+        }
+    }
+
     fn poll_capture(&mut self) {
         if !self.capture_mode || !self.ui_ready {
             return;
@@ -2190,6 +2574,7 @@ impl App {
         if self.capture_stage >= names.len() {
             if !self.selftest_done {
                 self.selftest_done = true;
+                self.seed_recent_probe_images();
                 self.selftest_started_at = Some(Instant::now());
                 let complete = self.selftest_complete.clone();
                 if let Some(webview) = &self.webview {
@@ -2208,6 +2593,17 @@ impl App {
                 // The self-test drives real controls and awaits state changes;
                 // do not resize under it while it is still running.
                 self.capture_next = Some(Instant::now() + Duration::from_millis(250));
+            } else if !self.recent_probe_logged {
+                self.recent_probe_logged = true;
+                if let Some(webview) = &self.webview {
+                    if let Err(err) = webview.evaluate_script_with_callback(
+                        "JSON.stringify(window.__crosshairRecentProbe || null)",
+                        |result| crate::logging::log(&format!("recent-menu: {result}")),
+                    ) {
+                        crate::logging::log(&format!("recent-menu: could not read: {err}"));
+                    }
+                }
+                self.capture_next = Some(Instant::now() + Duration::from_millis(100));
             } else if !self.layout_resized {
                 self.layout_resized = true;
                 if let Some(window) = &self.window {
@@ -2570,7 +2966,7 @@ impl App {
             return;
         }
         self.verify_started = true;
-        self.verify_deadline = Some(Instant::now() + Duration::from_secs(30));
+        self.verify_deadline = Some(Instant::now() + Duration::from_secs(45));
         crate::logging::log("verify: driving custom-preset create/delete in the live WebView");
         if let Err(err) = self.evaluate(VERIFY_JS) {
             self.fail_verify(&format!("could not evaluate verification script: {err}"));
@@ -2583,7 +2979,104 @@ impl App {
         }
         if self.verify_deadline.map(|deadline| Instant::now() >= deadline).unwrap_or(false) {
             self.fail_verify("timed out waiting for the page verification report");
+            return;
         }
+        if self.verify_image_seeded && !self.verify_image_deleted {
+            if self.verify_image_armed.load(Ordering::Relaxed) {
+                self.verify_overlay_last_requests = self.overlay.state().render_requests;
+                let live = config::crosshairs_dir().join("live-probe.png");
+                match std::fs::remove_file(&live) {
+                    Ok(()) => crate::logging::log("verify: deleted the live image after the page armed"),
+                    Err(err) => crate::logging::log(&format!("verify: could not delete the live image: {err}")),
+                }
+                self.verify_image_deleted = true;
+                if let Some(webview) = &self.webview {
+                    if let Err(err) = webview.evaluate_script_with_callback(
+                        "window.__crosshairLiveGone = true;",
+                        |_| {},
+                    ) {
+                        crate::logging::log(&format!("verify: could not signal the live-image deletion: {err}"));
+                    }
+                }
+            } else if self.verify_image_poll_at.map(|at| Instant::now() >= at).unwrap_or(true) {
+                self.verify_image_poll_at = Some(Instant::now() + Duration::from_millis(100));
+                let armed = self.verify_image_armed.clone();
+                if let Some(webview) = &self.webview {
+                    if let Err(err) = webview.evaluate_script_with_callback(
+                        "!!window.__crosshairLiveArmed",
+                        move |result| armed.store(result.contains("true"), Ordering::Relaxed),
+                    ) {
+                        crate::logging::log(&format!("verify: could not poll the live-image arming flag: {err}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compare the overlay's actual last input with the image operation the
+    /// page just performed. The request counter alone only proves a wake-up;
+    /// this checks the payload that the renderer would use.
+    fn accept_verify_overlay(&mut self, report_text: &str) {
+        if !self.verify_mode || self.verify_done {
+            return;
+        }
+        let value: serde_json::Value = match serde_json::from_str(report_text) {
+            Ok(value) => value,
+            Err(err) => {
+                crate::logging::log(&format!("verify: malformed overlay check: {err}"));
+                return;
+            }
+        };
+        let path = value
+            .get("payload")
+            .and_then(|payload| payload.get("path"))
+            .and_then(|path| path.as_str())
+            .unwrap_or("");
+        let use_probe = config::crosshairs_dir().join("use-probe.png");
+        let (expected_image, expected_name) = match path {
+            "use" => (
+                Some(use_probe.to_string_lossy().to_string()),
+                Some("use-probe.png".to_string()),
+            ),
+            "remove" | "delete" | "vanished" => (None, None),
+            other => {
+                crate::logging::log(&format!("verify: unknown overlay-check path {other:?}"));
+                return;
+            }
+        };
+        let applied = self.overlay.applied();
+        let actual_image = applied.as_ref().and_then(|input| input.config.image.clone());
+        let actual_name = applied.as_ref().and_then(|input| input.config.image_name.clone());
+        let requests = self.overlay.state().render_requests;
+        let counted = requests > self.verify_overlay_last_requests;
+        self.verify_overlay_last_requests = requests;
+        let state_ok = applied.is_some()
+            && actual_image == expected_image
+            && actual_name == expected_name;
+        let ok = counted && state_ok;
+        self.verify_overlay_checks.push(serde_json::json!({
+            "path": path,
+            "ok": ok,
+            "counted": counted,
+            "requests": requests,
+            "applied": applied.is_some(),
+            "expectedImage": expected_image,
+            "expectedName": expected_name,
+            "actualImage": actual_image,
+            "actualName": actual_name,
+        }));
+        if let Some(webview) = &self.webview {
+            if let Err(err) = webview.evaluate_script_with_callback(
+                "window.__crosshairOverlayChecked = (window.__crosshairOverlayChecked || 0) + 1;",
+                |_| {},
+            ) {
+                crate::logging::log(&format!("verify: could not acknowledge the overlay check: {err}"));
+            }
+        }
+        crate::logging::log(&format!(
+            "verify: overlay path={path} ok={ok} counted={counted} applied={} image={actual_image:?} name={actual_name:?}",
+            applied.is_some()
+        ));
     }
 
     fn finish_verify(&mut self, report_text: &str) {
@@ -2591,6 +3084,12 @@ impl App {
             return;
         }
         self.verify_done = true;
+        // The failed pick's own save must have cleared the image before the
+        // page saw FullState. Read before this final flush so a missing save
+        // cannot be hidden by the verifier's own persistence.
+        let persisted_before_flush = Config::load_from(&config::config_path());
+        let image_cleared_persisted = persisted_before_flush.crosshair.image.is_none()
+            && persisted_before_flush.crosshair.image_name.is_none();
         self.save_now();
         let report: serde_json::Value = match serde_json::from_str(report_text) {
             Ok(value) => value,
@@ -2625,18 +3124,60 @@ impl App {
         let errors_empty = empty_array("errors");
         let console_empty = empty_array("console");
         let setup_empty = empty_array("setup");
-        let ok = page_ok && steps_ok && errors_empty && console_empty && setup_empty && persisted_empty;
+        let image_modules = ["image-vanished", "image-use", "image-remove", "image-delete"];
+        let image_step_ok = image_modules.iter().all(|module| {
+            steps.iter().any(|step| {
+                step.get("module").and_then(|value| value.as_str()) == Some(*module)
+                    && step.get("ok").and_then(|value| value.as_bool()) == Some(true)
+            })
+        });
+        let image_order_ok = self.verify_image_steps.len() == 3
+            && self.verify_image_steps[0] == "cleared"
+            && self.verify_image_steps[1] == "repainted"
+            && self.verify_image_steps[2] == "persisted";
+        let overlay_paths = ["vanished", "use", "remove", "delete"];
+        let overlay_checks_ok = self.verify_overlay_checks.len() == overlay_paths.len()
+            && overlay_paths.iter().all(|path| {
+                self.verify_overlay_checks.iter().any(|check| {
+                    check.get("path").and_then(|value| value.as_str()) == Some(*path)
+                        && check.get("ok").and_then(|value| value.as_bool()) == Some(true)
+                })
+            });
+        let overlay_requested = !self.verify_overlay_checks.is_empty()
+            && self.verify_overlay_checks.iter().all(|check| {
+                check.get("counted").and_then(|value| value.as_bool()) == Some(true)
+            });
+        let ok = page_ok
+            && steps_ok
+            && image_step_ok
+            && image_order_ok
+            && overlay_requested
+            && overlay_checks_ok
+            && image_cleared_persisted
+            && self.verify_image_seeded
+            && errors_empty
+            && console_empty
+            && setup_empty
+            && persisted_empty;
         let output = serde_json::json!({
             "ok": ok,
             "mode": "--verify-preset-delete",
             "dataDir": config::data_dir().to_string_lossy(),
             "configPath": config::config_path().to_string_lossy(),
             "persistedCustomPresetIds": persisted_ids,
+            "imageSeeded": self.verify_image_seeded,
+            "imageClearedPersisted": image_cleared_persisted,
+            "imageOrder": self.verify_image_steps,
+            "imageStep": image_step_ok,
+            "overlayRequested": overlay_requested,
+            "overlayChecksOk": overlay_checks_ok,
+            "overlayChecks": self.verify_overlay_checks.clone(),
             "report": report,
         });
         self.write_verify_result(&output);
         crate::logging::log(&format!(
-            "verify: page_ok={page_ok} steps_ok={steps_ok} errors_empty={errors_empty} console_empty={console_empty} setup_empty={setup_empty} persisted_empty={persisted_empty}"
+            "verify: page_ok={page_ok} steps_ok={steps_ok} image_step_ok={image_step_ok} image_order_ok={image_order_ok} image_cleared_persisted={image_cleared_persisted} overlay_requested={overlay_requested} overlay_checks_ok={overlay_checks_ok} image_seeded={} errors_empty={errors_empty} console_empty={console_empty} setup_empty={setup_empty} persisted_empty={persisted_empty}",
+            self.verify_image_seeded
         ));
         self.exit_requested = true;
     }
@@ -2694,7 +3235,7 @@ impl App {
             crate::logging::log(&format!("config save failed: {err}"));
             self.emit(IpcEvent::DiagnosticBanner {
                 code: "config".into(),
-                message: format!("Settings could not be saved: {err}"),
+                message: "Couldn't save your settings.".into(),
                 recoverable: true,
             });
         }
@@ -2706,7 +3247,37 @@ impl App {
         self.dirty = true;
     }
 
-    fn save_preset(&mut self, module: &str, name: &str) {
+    /// A live image change must reach the overlay before the preview and the
+    /// save, or the desktop crosshair keeps the previous image until an
+    /// unrelated sync.
+    fn image_changed(&mut self) {
+        self.mark_dirty();
+        self.sync_overlay();
+        self.update_preview();
+    }
+
+    /// A failed pick or delete can leave the live image pointing at a file that
+    /// no longer exists. Drop it, repaint the Aim preview, and persist before
+    /// the caller publishes the refreshed state. Still-present files (for
+    /// example a locked delete target) are deliberately left alone.
+    fn drop_vanished_live_image(&mut self, name: &str) {
+        if !config::clear_vanished_live_image(&mut self.config.crosshair, name) {
+            return;
+        }
+        if self.verify_mode {
+            self.verify_image_steps.push("cleared");
+        }
+        self.image_changed();
+        if self.verify_mode {
+            self.verify_image_steps.push("repainted");
+        }
+        self.save_now();
+        if self.verify_mode {
+            self.verify_image_steps.push("persisted");
+        }
+    }
+
+    fn save_preset(&mut self, module: &str, name: &str, image_mode: bool) {
         let name = name.trim().chars().take(40).collect::<String>();
         if let Err(err) = actions::validate_preset_name(module, &name) {
             self.emit(IpcEvent::DiagnosticBanner { code: "preset".into(), message: err, recoverable: true });
@@ -2717,6 +3288,12 @@ impl App {
             "crosshair" => {
                 let mut preset = config::CrosshairPreset { id: id.clone(), name, builtin: false, config: self.config.crosshair.clone() };
                 preset.config.enabled = false;
+                if !image_mode {
+                    // A Shape-mode save owns only the shape. The user's current
+                    // image stays independent, exactly like a built-in preset.
+                    preset.config.image = None;
+                    preset.config.image_name = None;
+                }
                 self.config.custom.crosshair.push(preset);
                 self.config.crosshair.active_preset = Some(id);
             }
@@ -2861,29 +3438,32 @@ impl App {
         if !image_extension_supported(path) {
             self.emit(IpcEvent::DiagnosticBanner {
                 code: "image".into(),
-                message: "That file type is not supported. Use PNG, JPG, WebP, BMP, ICO, SVG or GIF.".into(),
+                message: "Unsupported file. Use PNG, JPG, WebP, GIF, SVG or BMP.".into(),
                 recoverable: true,
             });
             return;
         }
         match std::fs::metadata(path) {
             Ok(meta) if !import_size_allowed(meta.len()) => {
+                crate::logging::log(&format!(
+                    "image import: {} is {:.1} MB; the limit is {} MB",
+                    path.display(),
+                    meta.len() as f64 / (1024.0 * 1024.0),
+                    config::MAX_IMPORT_BYTES / (1024 * 1024)
+                ));
                 self.emit(IpcEvent::DiagnosticBanner {
                     code: "image".into(),
-                    message: format!(
-                        "That image is {:.1} MB; the limit is {} MB. Try a smaller export.",
-                        meta.len() as f64 / (1024.0 * 1024.0),
-                        config::MAX_IMPORT_BYTES / (1024 * 1024)
-                    ),
+                    message: format!("Image is too large. The limit is {} MB.", config::MAX_IMPORT_BYTES / (1024 * 1024)),
                     recoverable: true,
                 });
                 return;
             }
             Ok(_) => {}
             Err(err) => {
+                crate::logging::log(&format!("image import: could not read {}: {err}", path.display()));
                 self.emit(IpcEvent::DiagnosticBanner {
                     code: "image".into(),
-                    message: format!("Could not read that image: {err}"),
+                    message: "Couldn't open that image.".into(),
                     recoverable: true,
                 });
                 return;
@@ -2896,16 +3476,18 @@ impl App {
             Ok(_) => {
                 self.config.crosshair.image = Some(dest.to_string_lossy().to_string());
                 self.config.crosshair.image_name = Some(name);
-                self.mark_dirty();
-                self.update_preview();
+                self.image_changed();
                 self.save_now();
                 self.emit_full_state();
             }
-            Err(err) => self.emit(IpcEvent::DiagnosticBanner {
-                code: "image".into(),
-                message: format!("Could not import that image: {err}"),
-                recoverable: true,
-            }),
+            Err(err) => {
+                crate::logging::log(&format!("image import: could not copy to {}: {err}", dest.display()));
+                self.emit(IpcEvent::DiagnosticBanner {
+                    code: "image".into(),
+                    message: "Couldn't import that image.".into(),
+                    recoverable: true,
+                });
+            }
         }
     }
 
@@ -3186,8 +3768,13 @@ impl App {
             installed_games: self.installed_games.clone(),
             audio_curve: curve,
             master_gain: dsp_math::master_gain(&self.config.audio),
-            launch_at_login: self.config.settings.start_with_windows,
+            launch_at_login: if self.modes().live_system() {
+                startup_enabled_live()
+            } else {
+                self.config.settings.start_with_windows
+            },
             can_undo_restore: backup::restore_undo_available(&config::data_dir()),
+            crosshair_images: config::recent_crosshair_images(),
         };
         self.emit(IpcEvent::FullState(Box::new(payload)));
         self.sync_tray_geometry();
@@ -3208,6 +3795,12 @@ impl App {
             safety::restore_for_exit(self.config.settings.restore_display_on_exit);
         }
         self.compare_active = false;
+        if self.audio_compare_active {
+            self.audio_compare_active = false;
+            if self.modes().live_system() {
+                self.audio.apply(self.config.audio.clone());
+            }
+        }
         self.audio.shutdown();
         self.preview.shutdown();
         self.display.shutdown();
@@ -3277,6 +3870,45 @@ fn backup_config() {
                 crate::logging::log(&format!("config: backed up prior state to {}", backup.display()));
             }
         }
+    }
+}
+
+/// The evergreen runtime registers its version under one of these keys. A
+/// missing runtime is the most common reason a window never appears, so the
+/// check runs before the builder and produces a real message instead of a
+/// silent exit with code 0.
+fn webview2_preflight_error() -> Option<String> {
+    const CLIENT: &str = "Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
+    let machine = format!("SOFTWARE\\WOW6432Node\\{CLIENT}");
+    let user = format!("Software\\{CLIENT}");
+    let installed = read_reg_string(HKEY_LOCAL_MACHINE, &machine, "pv")
+        .or_else(|| read_reg_string(HKEY_LOCAL_MACHINE, CLIENT, "pv"))
+        .or_else(|| read_reg_string(HKEY_CURRENT_USER, &user, "pv"))
+        .is_some_and(|version| !version.trim().is_empty());
+    if installed {
+        None
+    } else {
+        Some("Microsoft Edge WebView2 Runtime was not found on this computer.".into())
+    }
+}
+
+fn show_startup_error(detail: &str) {
+    if crate::config::sandbox_root().is_some() {
+        return;
+    }
+    let message = format!(
+        "Crosshair+ could not create its window.\n\n{detail}\n\nWebView2 Runtime may be missing or broken. Install it from https://go.microsoft.com/fwlink/p/?LinkId=2124703 and start Crosshair+ again.\n\nLog: {}",
+        crate::config::log_path().display()
+    );
+    let message_wide: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+    let title_wide = wide("Crosshair+");
+    unsafe {
+        let _ = MessageBoxW(
+            None,
+            PCWSTR(message_wide.as_ptr()),
+            PCWSTR(title_wide.as_ptr()),
+            MB_ICONERROR | MB_OK,
+        );
     }
 }
 
@@ -3417,49 +4049,138 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
-fn apply_run_key(settings: &Settings) {
-    if crate::config::sandbox_root().is_some() {
-        crate::logging::log("sandbox: Windows startup entry left untouched");
-        return;
+const STARTUP_APPROVED_SUBKEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
+
+fn read_reg_string(root: HKEY, subkey: &str, name: &str) -> Option<String> {
+    let subkey = wide(subkey);
+    let name = wide(name);
+    let mut size = 0u32;
+    let status = unsafe {
+        RegGetValueW(root, PCWSTR(subkey.as_ptr()), PCWSTR(name.as_ptr()), RRF_RT_REG_SZ, None, None, Some(&mut size))
+    };
+    if status != ERROR_SUCCESS || size == 0 {
+        return None;
     }
-    apply_run_key_at(settings, run_key_subkey());
+    let mut data = vec![0u16; (size as usize / 2).max(1)];
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_SZ,
+            None,
+            Some(data.as_mut_ptr() as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let len = data.iter().position(|value| *value == 0).unwrap_or(data.len());
+    Some(String::from_utf16_lossy(&data[..len]))
 }
 
-fn apply_run_key_at(settings: &Settings, subkey: &str) {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            crate::logging::log(&format!("run key update skipped: cannot resolve executable: {err}"));
-            return;
-        }
-    };
-    let value = run_key_value(&exe);
+fn read_reg_binary(root: HKEY, subkey: &str, name: &str) -> Option<Vec<u8>> {
     let subkey = wide(subkey);
+    let name = wide(name);
+    let mut size = 0u32;
+    let status = unsafe {
+        RegGetValueW(root, PCWSTR(subkey.as_ptr()), PCWSTR(name.as_ptr()), RRF_RT_REG_BINARY, None, None, Some(&mut size))
+    };
+    if status != ERROR_SUCCESS || size == 0 {
+        return None;
+    }
+    let mut data = vec![0u8; size as usize];
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(name.as_ptr()),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(data.as_mut_ptr() as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    Some(data)
+}
+
+/// Task Manager writes a 12-byte record per startup item; a first byte of 3
+/// means the user disabled it without removing the Run value.
+fn startup_approved_disabled() -> bool {
+    read_reg_binary(HKEY_CURRENT_USER, STARTUP_APPROVED_SUBKEY, "CrosshairPlus")
+        .and_then(|data| data.first().copied())
+        .is_some_and(|state| state == 0x03)
+}
+
+fn apply_run_key(settings: &Settings) -> Result<(), String> {
+    if crate::config::sandbox_root().is_some() {
+        crate::logging::log("sandbox: Windows startup entry left untouched");
+        return Ok(());
+    }
+    apply_run_key_at(settings, run_key_subkey())?;
+    if settings.start_with_windows {
+        // Re-enabling must clear a Task-Manager disable, or Windows keeps
+        // suppressing the entry even though the Run value is correct.
+        let approved = wide(STARTUP_APPROVED_SUBKEY);
+        let name = wide("CrosshairPlus");
+        unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(approved.as_ptr()), PCWSTR(name.as_ptr()));
+        }
+    }
+    Ok(())
+}
+
+fn apply_run_key_at(settings: &Settings, subkey: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("cannot resolve executable: {err}"))?;
+    let value = run_key_value(&exe);
+    let key = wide(subkey);
     let name = wide("CrosshairPlus");
-    unsafe {
-        if settings.start_with_windows {
-            let data = wide(&value);
-            let result = RegSetKeyValueW(
+    if settings.start_with_windows {
+        let data = wide(&value);
+        let result = unsafe {
+            RegSetKeyValueW(
                 HKEY_CURRENT_USER,
-                PCWSTR(subkey.as_ptr()),
+                PCWSTR(key.as_ptr()),
                 PCWSTR(name.as_ptr()),
                 1,
                 Some(data.as_ptr() as *const c_void),
                 (data.len() * 2) as u32,
-            );
-            if result.is_err() {
-                crate::logging::log(&format!("run key update failed: {result:?}"));
-            }
-        } else {
-            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), PCWSTR(name.as_ptr()));
+            )
+        };
+        if result.is_err() {
+            return Err(format!("RegSetKeyValueW failed: {result:?}"));
+        }
+        // Read the value back instead of trusting the write: a policy or a
+        // redirected hive can accept the call and still not persist it.
+        let stored = read_reg_string(HKEY_CURRENT_USER, subkey, "CrosshairPlus")
+            .ok_or_else(|| "the Run value could not be read back".to_string())?;
+        if !stored.eq_ignore_ascii_case(&value) {
+            return Err(format!("the Run value read back as '{stored}'"));
+        }
+    } else {
+        unsafe {
+            let _ = RegDeleteKeyValueW(HKEY_CURRENT_USER, PCWSTR(key.as_ptr()), PCWSTR(name.as_ptr()));
         }
     }
+    Ok(())
+}
+
+/// The launch-at-login state the user actually has, not the checkbox they set.
+fn startup_enabled_live() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    let expected = run_key_value(&exe);
+    let stored = read_reg_string(HKEY_CURRENT_USER, run_key_subkey(), "CrosshairPlus");
+    stored.as_deref().is_some_and(|value| value.eq_ignore_ascii_case(&expected))
+        && !startup_approved_disabled()
 }
 
 #[cfg(test)]
-use windows::Win32::Foundation::ERROR_SUCCESS;
-#[cfg(test)]
-use windows::Win32::System::Registry::{RegDeleteKeyW, RegGetValueW, RRF_RT_REG_SZ};
+use windows::Win32::System::Registry::RegDeleteKeyW;
 
 #[cfg(test)]
 fn read_run_key_at(subkey: &str) -> Result<Option<String>, String> {
@@ -3637,17 +4358,34 @@ fn deferred_audio_reconcile_due(pending: &mut bool, enabled: bool, fx: &FxSoundS
     true
 }
 
-fn apply_run_key_checked(settings: &Settings, modes: RunModes) {
-    if modes.live_system() {
-        apply_run_key(settings);
-    } else {
+fn apply_run_key_checked(settings: &Settings, modes: RunModes) -> Option<String> {
+    if !modes.live_system() {
         crate::logging::log("sandbox: Windows startup entry left untouched");
+        return None;
+    }
+    match apply_run_key(settings) {
+        Ok(()) => None,
+        Err(err) => {
+            crate::logging::log(&format!("run key update failed: {err}"));
+            Some("Windows startup could not be updated. Open Settings and toggle Launch with Windows again.".into())
+        }
     }
 }
 
 /// Global hotkeys are registered on the real desktop, so only a live launch
 /// may publish any. Stress and interaction still get the overlay and OSD, but
 /// with an empty binding list.
+/// Build the exact payload handed to the overlay thread. Kept separate so the
+/// verify payload-boundary test covers the same construction as sync_overlay.
+fn overlay_input(
+    crosshair: &crate::config::CrosshairConfig,
+    rect: Option<(i32, i32, u32, u32)>,
+    hotkeys: Vec<crate::overlay::HotkeyBinding>,
+    monitor_label: String,
+) -> OverlayInput {
+    OverlayInput { config: crosshair.clone(), rect, hotkeys, monitor_label }
+}
+
 fn active_hotkeys(modes: RunModes, config: &Config) -> Vec<crate::overlay::HotkeyBinding> {
     if modes.live_system() { hotkeys::bindings(config) } else { Vec::new() }
 }
@@ -3670,732 +4408,18 @@ fn open_windows_display() {
     }
 }
 
-const FX_VERIFY_JS: &str = r##"(async () => {
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const waitFor = async (fn, timeout, label) => {
-    const end = Date.now() + timeout;
-    while (Date.now() < end) {
-      if (fn()) return;
-      await sleep(100);
-    }
-    throw new Error(`Timed out waiting for ${label}`);
-  };
-  const report = (payload) => window.__crosshairSend('FxVerifyReport', payload);
-  try {
-    await waitFor(() => window.__crosshairReady === true, 12000, 'the UI ready state');
-    const config = window.__crosshairState?.config;
-    if (!config?.audio) throw new Error("the audio config is unavailable");
-    // The expectation comes from the real config file in the app, not from
-    // this sandboxed page state.
-    report({
-      ok: true,
-      steps: { uiReady: true, configRead: true, readOnly: true },
-    });
-  } catch (error) {
-    report({ ok: false, error: String((error && error.message) || error) });
-  }
-})();
-"##;
+const FX_VERIFY_JS: &str = include_str!("../ui/harness/fx_verify.js");
 
-const VERIFY_INIT_JS: &str = r#"
-(function () {
-  const errors = [];
-  const consoleMessages = [];
-  window.__crosshairVerifyErrors = errors;
-  window.__crosshairVerifyConsole = consoleMessages;
-  const text = (value) => (value && value.message) ? String(value.message) : String(value);
-  window.addEventListener("error", (event) => errors.push("error: " + text(event.message || event.error || "unknown")));
-  window.addEventListener("unhandledrejection", (event) => errors.push("unhandledrejection: " + text(event.reason)));
-  ["log", "warn", "error"].forEach((level) => {
-    const original = console[level];
-    console[level] = function (...args) {
-      consoleMessages.push(level + ": " + args.map(text).join(" "));
-      return original.apply(this, args);
-    };
-  });
-})();
-"#;
+const VERIFY_INIT_JS: &str = include_str!("../ui/harness/verify_init.js");
 
-const VERIFY_JS: &str = r#"
-(async () => {
-  const result = { ok: false, steps: [], errors: [], console: [], setup: [] };
-  const finish = () => {
-    result.errors = (window.__crosshairVerifyErrors || []).slice();
-    result.console = (window.__crosshairVerifyConsole || []).slice();
-    result.ok = result.steps.length === 3
-      && result.steps.every((step) => step.ok === true)
-      && result.errors.length === 0
-      && result.console.length === 0
-      && result.setup.length === 0;
-    try {
-      window.ipc.postMessage(JSON.stringify({ v: 1, type: "VerifyReport", payload: result }));
-    } catch (_) {}
-  };
-  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const waitFor = async (check, timeout = 6000) => {
-    const started = Date.now();
-    while (Date.now() - started < timeout) {
-      const value = check();
-      if (value) return value;
-      await sleep(50);
-    }
-    return null;
-  };
-  try {
-    if (!(await waitFor(() => window.__crosshairReady === true, 10000))) {
-      result.setup.push("ui-not-ready");
-      return finish();
-    }
-    const modules = [
-      { module: "crosshair", name: "Sandbox Crosshair", trigger: '#aimPresetTrigger', menu: '#aimPresetMenu', del: '#aimPresetDelete' },
-      { module: "display", name: "Sandbox Display", trigger: '#displayPresetTrigger', menu: '#displayPresetMenu', del: '#displayPresetDelete' },
-      { module: "audio", name: "Sandbox Audio", trigger: '#audioPresetTrigger', menu: '#audioPresetMenu', del: '#audioPresetDelete' }
-    ];
-    for (const spec of modules) {
-      const step = { module: spec.module, ok: false, created: false, saveSent: false, deleteSent: false, removed: false, id: null };
-      result.steps.push(step);
-      const saveButton = document.querySelector(`[data-action="save-preset"][data-module="${spec.module}"]`);
-      if (!saveButton) { step.error = "missing-save-control"; continue; }
-      window.__crosshairAutoConfirm = true;
-      saveButton.click();
-      const nameInput = document.querySelector('#presetName');
-      const submit = document.querySelector('#presetModal [data-action="submit-preset"]');
-      if (!nameInput || !submit) { step.error = "missing-preset-modal"; continue; }
-      nameInput.value = spec.name;
-      submit.click();
-      step.saveSent = !!(window.__lastSent && window.__lastSent.type === "SavePreset" && window.__lastSent.payload && window.__lastSent.payload.module === spec.module && window.__lastSent.payload.name === spec.name);
-      const menu = document.querySelector(spec.menu);
-      const item = await waitFor(() => Array.from(menu?.querySelectorAll('.preset-option') || []).find((node) => (node.textContent || "").includes(spec.name)));
-      if (!item) { step.error = "custom-preset-not-rendered"; continue; }
-      step.created = true;
-      step.id = item.dataset.id || null;
-      const deleteButton = await waitFor(() => { const button = document.querySelector(spec.del); return button && !button.disabled ? button : null; });
-      if (!deleteButton) { step.error = "missing-delete-control"; continue; }
-      deleteButton.click();
-      step.deleteSent = !!(window.__lastSent && window.__lastSent.type === "DeletePreset" && window.__lastSent.payload && window.__lastSent.payload.module === spec.module && window.__lastSent.payload.id === step.id);
-      const removed = await waitFor(() => !Array.from(menu?.querySelectorAll('.preset-option') || []).some((node) => node.dataset.id === step.id));
-      step.removed = !!removed;
-      step.ok = step.created && step.saveSent && step.deleteSent && step.removed;
-      if (!step.ok && !step.error) step.error = "delete-not-confirmed";
-    }
-  } catch (error) {
-    result.setup.push("exception: " + String(error));
-  }
-  finish();
-})();
-"#;
+const VERIFY_JS: &str = include_str!("../ui/harness/verify.js");
 
 /// Adversarial driver for `--stress`. It drives the real DOM handlers and the
 /// real IPC bridge twice, drains the command queue with a FullState barrier,
 /// then reports a warm baseline so leak growth is measured per cycle instead of
 /// against cold-start allocations.
-const STRESS_JS: &str = r##"(() => {
-  const errors = [];
-  const checks = [];
-  const post = (payload) => window.ipc.postMessage(JSON.stringify({ v: 1, type: "StressReport", payload }));
-  const check = (name, ok) => { if (!ok) errors.push("check: " + name); checks.push({ name, ok: !!ok }); };
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const click = (selector) => { const el = document.querySelector(selector); if (el) { el.click(); return true; } return false; };
-  window.addEventListener("error", (event) => errors.push("error: " + (event.message || event.type)));
-  window.addEventListener("unhandledrejection", (event) => errors.push("rejection: " + String((event.reason && event.reason.message) || event.reason)));
-  window.__qaFullStates = 0;
-  if (typeof window.__crosshair_onMessage === "function") {
-    const inner = window.__crosshair_onMessage;
-    window.__crosshair_onMessage = (message) => {
-      if (message && message.type === "FullState") { window.__qaFullStates++; }
-      return inner(message);
-    };
-  }
-  const waitForStates = async (target, ms) => {
-    const start = Date.now();
-    while (window.__qaFullStates < target && Date.now() - start < ms) { await wait(25); }
-    return window.__qaFullStates >= target;
-  };
-  (async () => {
-    const S = window.__crosshairState;
-    const send = window.__crosshairSend;
-    const drain = async () => {
-      const target = window.__qaFullStates + 2;
-      send("ToggleMaster", { module: "crosshair" });
-      send("ToggleMaster", { module: "crosshair" });
-      const ok = await waitForStates(target, 8000);
-      await wait(250);
-      return ok;
-    };
-    const cycle = async (round) => {
-      const tabs = ["aim", "display", "audio", "slots"];
-      for (let i = 0; i < 120; i++) { window.__crosshair_setTab(tabs[i % tabs.length]); }
-      for (let i = 0; i < 20; i++) {
-        click('[data-action="settings"]'); click('[data-action="close-settings"]');
-        click('[data-action="open-backup"]'); click('[data-action="close-backup-modal"]');
-        click('[data-action="open-import"]'); click('[data-action="close-import-modal"]');
-        click('[data-action="open-preset"]'); click('[data-action="close-preset-modal"]');
-        click('[data-action="fix-display"]'); click('[data-action="close-fx-modal"]');
-      }
-      const base = S.config.crosshair;
-      for (let batch = 0; batch < 10; batch++) {
-        for (let i = 0; i < 50; i++) {
-          const extreme = (batch + i) % 2 === 0
-            ? { size: 48, thickness: 10, gap: 24, opacity: 10 }
-            : { size: 2, thickness: 1, gap: 0, opacity: 100 };
-          send("UpdateCrosshair", { crosshair: Object.assign({}, base, extreme) });
-        }
-        await wait(20);
-      }
-      for (let batch = 0; batch < 4; batch++) {
-        for (let i = 0; i < 50; i++) {
-          send("UpdateDisplay", { display: S.config.display });
-          send("UpdateSound", { audio: S.config.audio });
-        }
-        await wait(20);
-      }
-      await wait(round === 0 ? 400 : 600);
-    };
-    try {
-      check("bridge", !!S && typeof send === "function" && typeof window.__crosshair_setTab === "function");
-      const focus = window.__crosshairStressFocus;
-      if (focus) {
-        await wait(600);
-        const base = S.config.crosshair;
-        post({ phase: "baseline", ok: true, errors, checks: [{ name: "focus-" + focus, ok: true }] });
-        if (focus === "crosshair") {
-          for (let i = 0; i < 300; i++) { send("UpdateCrosshair", { crosshair: Object.assign({}, base, { size: 10 + (i % 30) }) }); }
-        } else if (focus === "display") {
-          for (let i = 0; i < 300; i++) { send("UpdateDisplay", { display: S.config.display }); }
-        } else if (focus === "sound") {
-          for (let i = 0; i < 300; i++) { send("UpdateSound", { audio: S.config.audio }); }
-        } else if (focus === "tabs") {
-          for (let i = 0; i < 600; i++) { window.__crosshair_setTab(["aim", "display", "audio", "slots"][i % 4]); }
-        } else if (focus === "modals" || ["settings", "backup", "import", "preset", "fx"].indexOf(focus) >= 0) {
-          const pairs = {
-            settings: ['[data-action="settings"]', '[data-action="close-settings"]'],
-            backup: ['[data-action="open-backup"]', '[data-action="close-backup-modal"]'],
-            import: ['[data-action="open-import"]', '[data-action="close-import-modal"]'],
-            preset: ['[data-action="open-preset"]', '[data-action="close-preset-modal"]'],
-            fx: ['[data-action="fix-display"]', '[data-action="close-fx-modal"]'],
-          };
-          const chosen = focus === "modals" ? Object.keys(pairs) : [focus];
-          for (let i = 0; i < 100; i++) {
-            for (const key of chosen) { click(pairs[key][0]); click(pairs[key][1]); }
-          }
-        }
-        await drain();
-        await wait(800);
-        post({ phase: "final", ok: errors.length === 0, errors, checks: [{ name: "focus-" + focus + "-done", ok: true }] });
-        return;
-      }
-      if (window.__crosshairStressIdle) {
-        await wait(15000);
-        post({ phase: "baseline", ok: true, errors, checks: [{ name: "idle-baseline", ok: true }] });
-        await wait(15000);
-        check("idle-alive", !!window.__crosshairReady);
-        post({ phase: "final", ok: errors.length === 0, errors, checks });
-        return;
-      }
-      window.__xss = undefined;
-      const hostile = '<img src=x onerror="window.__xss=1"><script>window.__xss=2</script>';
-      const beforePreset = window.__qaFullStates;
-      send("SavePreset", { module: "crosshair", name: hostile });
-      const presetHandled = await waitForStates(beforePreset + 1, 3000);
-      window.__crosshair_setTab("aim");
-      click('[data-action="open-preset"]');
-      await wait(200);
-      const menu = document.querySelector("#aimPresetMenu");
-      const names = (S.crosshairPresets || []).map((preset) => String(preset.name || ""));
-      const created = names.find((name) => name.indexOf("<img src=x") >= 0);
-      check("xss-preset-created", !!created);
-      check("xss-no-handler", window.__xss === undefined);
-      check("xss-no-element", !document.querySelector('img[src="x"]') && !document.querySelector("#aimPresetMenu script"));
-      check("xss-literal", !!created && !!menu && (menu.textContent || "").indexOf("<img src=x") >= 0);
-      click('[data-action="close-preset-modal"]');
-      const preset = (S.crosshairPresets || []).find((entry) => String(entry.name || "").indexOf("<img src=x") >= 0);
-      if (preset) {
-        const beforeDelete = window.__qaFullStates;
-        send("DeletePreset", { module: "crosshair", id: preset.id });
-        await waitForStates(beforeDelete + 1, 3000);
-      }
-      await cycle(0);
-      const drained = await drain();
-      check("drain", drained);
-      window.__crosshair_setTab("aim");
-      await wait(80);
-      check("tabs", document.body.dataset.tab === "aim");
-      check("modals-closed", !!document.querySelector("#settingsModal")?.classList.contains("hidden") && !!document.querySelector("#fxModal")?.classList.contains("hidden"));
-      check("layout-width", document.documentElement.scrollWidth <= window.innerWidth + 1);
-      post({ phase: "baseline", ok: errors.length === 0, errors, checks, debug: { presetFound: !!created, presetHandled, presetCount: names.length, menuLen: (menu && menu.textContent || "").length } });
-      await cycle(1);
-      await cycle(2);
-      const drainedFinal = await drain();
-      await wait(1500);
-      check("drain-final", drainedFinal);
-      check("layout-width-final", document.documentElement.scrollWidth <= window.innerWidth + 1);
-      check("ui-alive", !!document.querySelector("#main") && !!window.__crosshairReady);
-      post({ phase: "final", ok: errors.length === 0, errors, checks, debug: { presetFound: !!created, presetCount: names.length } });
-    } catch (err) {
-      errors.push("fatal: " + String((err && err.message) || err));
-      post({ phase: "final", ok: false, errors, checks });
-    }
-  })();
-})();"##;
-const SELFTEST_JS: &str = r#"(() => {
-  const errors = [];
-  let labelMetrics = null;
-  const check = (name, ok) => { if (!ok) errors.push(name); };
-  try {
-    check('viewport', innerWidth === 1200 && innerHeight === 780);
-    check('ui-ready', window.__crosshairReady === true);
-    check('protocol-origin', location.protocol === 'https:' && location.host === 'app.localhost');
-    check('ipc-bridge', typeof window.ipc?.postMessage === 'function');
-    check('true-black', getComputedStyle(document.body).backgroundColor === 'rgb(0, 0, 0)');
-    check('header-60', Math.round(document.querySelector('.topbar')?.getBoundingClientRect().height || 0) === 60);
-    const topbar = document.querySelector('.topbar');
-    const tabsBox = document.querySelector('.tabs')?.getBoundingClientRect();
-    check('header-layout', !!tabsBox && Math.abs((tabsBox.left + tabsBox.right) / 2 - innerWidth / 2) <= 1);
-    check('header-brand-removed', !document.querySelector('.brand img') && !document.querySelector('.brand-icon'));
-    check('header-controls-moved', !!topbar && !topbar.querySelector('.top-actions') && !topbar.querySelector('[data-action="settings"]'));
-    const aimTab = document.querySelector('.tabs [role=tab][data-tab="aim"]');
-    aimTab?.focus();
-    aimTab?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
-    check('tab-arrow-keys', document.body.dataset.tab === 'display' && document.activeElement?.dataset?.tab === 'display' && document.querySelector('.tabs [role=tab][data-tab="display"]')?.getAttribute('aria-selected') === 'true');
-    document.querySelector('[data-tab="aim"]')?.click();
-    const footer = document.querySelector('.statusbar');
-    const badge = document.querySelector('#slotBadge');
-    const footerBox = footer?.getBoundingClientRect();
-    const badgeBox = badge?.getBoundingClientRect();
-    check('footer-bottom', !!footerBox && Math.round(footerBox.height) === 46 && Math.abs(footerBox.bottom - innerHeight) <= 1);
-    check('footer-module-controls', !!footer && footer.querySelectorAll('.quick-toggle').length === 3 && !!footer.querySelector('.statusbar-settings'));
-    check('slot-chip-footer', !!badge && !!footer && footer.contains(badge) && !!badgeBox && badgeBox.top >= footerBox.top - 1 && badgeBox.bottom <= footerBox.bottom + 1);
-    check('no-top-slot-chip', !!badge && !topbar.contains(badge));
-    const topbarWidth = topbar.style.width;
-    topbar.style.width = '1080px';
-    const narrowTabs = document.querySelector('.tabs').getBoundingClientRect();
-    check('header-layout-narrow', Math.abs((narrowTabs.left + narrowTabs.right) / 2 - 540) <= 1);
-    topbar.style.width = topbarWidth;
-    check('left-column-420', getComputedStyle(document.querySelector('.three-column')).gridTemplateColumns.startsWith('420px'));
-    check('flat-cards', getComputedStyle(document.querySelector('.card')).boxShadow === 'none');
-    const nonAppImages = Array.from(document.querySelectorAll('img[src^="data:image"]')).filter((img) => !img.closest('.app-icon'));
-    check('no-base64-inline-images', nonAppImages.length === 0);
-    check('four-tabs', document.querySelectorAll('.tab').length === 4);
-    check('active-monitor', (document.querySelector('#aimMonitor')?.textContent || '').includes('AOC'));
-    check('behavior-tooltips', document.querySelector('[data-bind="crosshair.hide_in_menus"]')?.getAttribute('aria-label')?.includes('Start, taskbar, desktop or app menus') && document.querySelectorAll('#aimVisibility .seg').length === 3 && document.querySelector('[data-bind="crosshair.hide_in_menus"]')?.closest('.row-toggle')?.querySelector('span')?.title.includes('Start, taskbar'));
-    check('aim-visibility-control', document.querySelector('#aimVisibility [data-value="always"]') && document.querySelector('#aimVisibility [data-value="hide"]') && document.querySelector('#aimVisibility [data-value="only"]'));
-    const visTrack = document.querySelector('#aimVisibility');
-    const visLabel = document.querySelector('.aim-visibility .aim-visibility-label');
-    const visCard = visTrack?.closest('.card');
-    const visCardStyle = visCard ? getComputedStyle(visCard) : null;
-    const visCardInner = visCard && visCardStyle
-      ? visCard.getBoundingClientRect().width
-        - parseFloat(visCardStyle.paddingLeft) - parseFloat(visCardStyle.paddingRight)
-        - parseFloat(visCardStyle.borderLeftWidth) - parseFloat(visCardStyle.borderRightWidth)
-      : 0;
-    check('aim-visibility-stacked', !!visTrack && !!visLabel && visLabel.getBoundingClientRect().bottom <= visTrack.getBoundingClientRect().top + 1);
-    check('aim-visibility-track', !!visTrack
-      && getComputedStyle(visTrack).gridTemplateColumns.split(' ').length === 3
-      && getComputedStyle(visTrack).borderRadius === '10px'
-      && getComputedStyle(visTrack).padding === '3px'
-      && getComputedStyle(visTrack).gap === '3px'
-      && getComputedStyle(visTrack).backgroundColor === 'rgb(11, 13, 18)'
-      && getComputedStyle(visTrack).borderTopColor === 'rgb(34, 37, 45)');
-    check('aim-visibility-full-width', !!visTrack && Math.abs(visTrack.getBoundingClientRect().width - visCardInner) <= 1);
-    const visActive = visTrack?.querySelector('.seg.active');
-    const visIdle = visTrack?.querySelector('.seg:not(.active)');
-    check('aim-visibility-active', !!visActive
-      && getComputedStyle(visActive).backgroundColor === 'rgb(78, 168, 255)'
-      && getComputedStyle(visActive).color === 'rgb(4, 16, 27)'
-      && Number(getComputedStyle(visActive).fontWeight) >= 700
-      && getComputedStyle(visActive).borderRadius === '7px');
-    check('aim-visibility-inactive', !!visIdle
-      && getComputedStyle(visIdle).backgroundColor === 'rgba(0, 0, 0, 0)'
-      && getComputedStyle(visIdle).color === 'rgb(120, 128, 144)');
-    check('aim-visibility-readable', !!visActive && !!visIdle
-      && [visActive, visIdle].every((el) => parseFloat(getComputedStyle(el).fontSize) >= 13 && parseFloat(getComputedStyle(el).fontSize) <= 14));
-    check('aim-visibility-clipping', !!visTrack
-      && visTrack.scrollWidth <= visTrack.clientWidth + 1
-      && Array.from(visTrack.querySelectorAll('.seg')).every((el) => el.scrollWidth <= el.clientWidth + 1));
-    check('image-format-copy', (document.querySelector('#dropzone')?.textContent || '').includes('BMP') && (document.querySelector('#dropzone')?.textContent || '').includes('ICO'));
-    document.querySelector('[data-tab="aim"]')?.click();
-    check('preview-image', (document.querySelector('#aimPreview')?.naturalWidth || 0) > 0);
-    check('preview-route', (document.querySelector('#aimPreview')?.getAttribute('src') || '').startsWith('/preview'));
-    check('preview-image-size', document.querySelector('#aimPreview')?.getBoundingClientRect().width > 300);
-    const aimStage = document.querySelector('#aimStage')?.getBoundingClientRect();
-    check('aim-preview-16-9', !!aimStage && Math.abs(aimStage.width / aimStage.height - 16 / 9) < 0.02);
-    check('preset-picker', !!document.querySelector('#aimPresetTrigger') && !!document.querySelector('#aimPresetMenu'));
-    check('preset-icon', (document.querySelector('#aimPresetIcon')?.naturalWidth || 0) > 0);
-    check('preset-names', ['Pro Plus', 'Precision Dot', 'Tracking Ring', 'Ring + Dot', 'Triangle', 'Chevron', 'Open T-Cross'].every((name) => Array.from(document.querySelectorAll('#aimPresetMenu .preset-option')).some((node) => (node.querySelector('span')?.textContent || '').trim() === name)) && !/\b(Casual|Hairline)\b/.test(document.querySelector('#aimPresetMenu')?.innerText || ''));
-    check('shape-controls', !!document.querySelector('#dotSizeRow') && !!document.querySelector('#outlineWidthRow'));
-    document.querySelector('#fxModal')?.classList.add('hidden');
-    document.querySelector('#backupModal')?.classList.add('hidden');
-    document.querySelector('#colorTrigger')?.click();
-    check('color-popover-open', !document.querySelector('#colorPopover')?.classList.contains('hidden') && !!document.querySelector('#colorSv') && !!document.querySelector('#colorHue') && !!document.querySelector('#colorHex'));
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    check('color-popover-escape', document.querySelector('#colorPopover')?.classList.contains('hidden'));
-    check('active-tab-rounded', (() => { const tab = document.querySelector('.tab.active'); if (!tab) return false; const style = getComputedStyle(tab); return parseFloat(style.borderRadius) >= 8 && style.borderBottomWidth === style.borderTopWidth; })());
-    const activeSwatch = document.querySelector('.swatch.active');
-    const customColorActive = !!document.querySelector('#colorTrigger')?.classList.contains('active');
-    check('swatch-selected-border', (!!activeSwatch && parseFloat(getComputedStyle(activeSwatch).borderTopWidth) >= 3) || customColorActive);
-    check('custom-color-rainbow', getComputedStyle(document.querySelector('#colorTrigger')).backgroundImage.includes('conic-gradient'));
-    check('collapsible-advanced', document.querySelectorAll('details.more-options').length === 2 && document.querySelector('#displayMore') && document.querySelector('#audioMore') && !document.querySelector('#displayMore').open && !document.querySelector('#audioMore').open);
-    check('aim-advanced-visible', (document.querySelector('#shapePanel .stepper-field')?.getBoundingClientRect().height || 0) > 0 && (document.querySelector('[data-bind="crosshair.rotation"]')?.getBoundingClientRect().height || 0) > 0);
-    check('aim-label-typography', getComputedStyle(document.querySelector('#outlineWidthRow > span')).fontSize === '16px' && getComputedStyle(document.querySelector('#dotSizeRow > span')).fontSize === '16px');
-    const steppers = Array.from(document.querySelectorAll('.stepper-field'));
-    check('offset-steppers', steppers.length === 2 && steppers.every((field) => field.querySelectorAll('.stepper-buttons button').length === 2));
-    const stepButton = document.querySelector('.stepper-buttons button');
-    const stepBox = stepButton?.getBoundingClientRect();
-    check('offset-stepper-size', !!stepBox && Math.round(stepBox.width) >= 38 && Math.round(stepBox.width) <= 42 && Math.round(stepBox.height) >= 18 && Math.round(stepBox.height) <= 22);
-    const offsetX = document.querySelector('[data-bind="crosshair.offset_x"]');
-    const beforeOffset = offsetX?.value;
-    stepButton?.click();
-    check('offset-step-command', String(Number(offsetX?.value)) === String(Number(beforeOffset) + 1));
-    stepButton?.click();
-    const dotOn = !!document.querySelector('[data-bind="crosshair.dot"]')?.checked;
-    check('dot-size-conditional', document.querySelector('#dotSizeRow')?.classList.contains('hidden') === !dotOn);
-    const outlineOn = !!document.querySelector('[data-bind="crosshair.outline"]')?.checked;
-    check('outline-width-conditional', document.querySelector('#outlineWidthRow')?.classList.contains('hidden') === !outlineOn);
-    check('no-style-grid', !document.querySelector('#styleGrid'));
-    check('no-placeholder', !document.body.innerText.includes('Initializing in later phase'));
-    check('header-controls', ['masterCrosshair', 'masterDisplay', 'masterAudio'].every((id) => document.querySelector('#' + id)));
-    const master = document.querySelector('#masterCrosshair');
-    master?.click();
-    check('master-command', window.__lastSent?.type === 'ToggleMaster');
-    master?.click();
-    document.querySelector('[data-action="aim-mode"][data-value="image"]')?.click();
-    check('image-mode', !document.querySelector('#imagePanel')?.classList.contains('hidden') && document.querySelector('#shapePanel')?.classList.contains('hidden'));
-    const solidBefore = !!S.config.crosshair.imageSolid;
-    const tintBefore = !!S.config.crosshair.imageTint;
-    S.config.crosshair.imageSolid = true;
-    S.config.crosshair.imageTint = false;
-    syncAimConditionals();
-    check('image-solid-row', !document.querySelector('#solidColorRow')?.classList.contains('hidden'));
-    check('image-solid-label', document.querySelector('#modeColorLabel')?.textContent === 'Silhouette color');
-    check('image-solid-active', !!document.querySelector('#solidMode [data-action="image-mode"][data-value="solid"]')?.classList.contains('active') && !document.querySelector('#solidMode [data-action="image-mode"][data-value="tint"]')?.classList.contains('active'));
-    S.config.crosshair.imageSolid = false;
-    S.config.crosshair.imageTint = true;
-    syncAimConditionals();
-    check('image-tint-row', !document.querySelector('#solidColorRow')?.classList.contains('hidden'));
-    check('image-tint-label', document.querySelector('#modeColorLabel')?.textContent === 'Tint color');
-    check('image-tint-active', !!document.querySelector('#solidMode [data-action="image-mode"][data-value="tint"]')?.classList.contains('active'));
-    S.config.crosshair.imageSolid = solidBefore;
-    S.config.crosshair.imageTint = tintBefore;
-    syncAimConditionals();
-    check('image-mode-restored', document.querySelector('#solidColorRow')?.classList.contains('hidden') === !(solidBefore || tintBefore) && !!document.querySelector('#solidMode [data-action="image-mode"][data-value="original"]')?.classList.contains('active') === !(solidBefore || tintBefore));
-    document.querySelector('[data-action="aim-mode"][data-value="shape"]')?.click();
-    document.querySelector('[data-tab="display"]')?.click();
-    check('display-tab', document.querySelector('#view-display')?.classList.contains('active'));
-    check('display-advanced-visible', (document.querySelector('#panelSelect')?.getBoundingClientRect().height || 0) > 0 && (document.querySelector('[data-display="r"]')?.getBoundingClientRect().height || 0) > 0);
-    check('display-panels', document.querySelectorAll('#panelSelect option').length === 7);
-    const panelBefore = document.querySelector('#panelSelect')?.value;
-    applyPreset('display', 'cinema');
-    check('display-preset-keeps-panel', document.querySelector('#panelSelect')?.value === panelBefore);
-    S.config.display.global.panel = 'auto';
-    renderDisplay();
-    const autoMonitor = displayMonitor();
-    const expectedAutoLabel = `Auto (${String(autoMonitor?.detectedPanel || 'led').toUpperCase()})`;
-    check('display-auto-panel-label', document.querySelector('#panelSelect')?.selectedOptions[0]?.textContent === expectedAutoLabel);
-    check('display-sliders', document.querySelectorAll('.content > .card [data-display]').length === 4);
-    check('display-applied', (document.querySelector('#displayStatus')?.textContent || '') === 'APPLIED');
-    check('compare-display-control', (document.querySelector('#compareDisplay')?.getBoundingClientRect().width || 0) > 0);
-    const compareControl = document.querySelector('#compareDisplay');
-    const compareSlider = document.querySelector('[data-display="brightness"]');
-    compareControl?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerId: 7, pointerType: 'mouse', isPrimary: true }));
-    check('compare-hold', !!compareControl && S.compareActive === true && compareControl.getAttribute('aria-pressed') === 'true' && !!compareSlider?.disabled && window.__lastSent?.type === 'CompareDisplay' && window.__lastSent?.payload?.active === true);
-    compareControl?.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, button: 0, pointerId: 7, pointerType: 'mouse', isPrimary: true }));
-    check('compare-release', S.compareActive === false && compareControl?.getAttribute('aria-pressed') === 'false' && !compareSlider?.disabled && window.__lastSent?.type === 'CompareDisplay' && window.__lastSent?.payload?.active === false);
-    check('backlight-yellow', getComputedStyle(document.querySelector('#backlightReadout')).color === 'rgb(255, 230, 0)');
-    const displayStage = document.querySelector('#displayStage')?.getBoundingClientRect();
-    check('display-preview-16-9', !!displayStage && Math.abs(displayStage.width / displayStage.height - 16 / 9) < 0.02);
-    check('single-monitor-controls', document.querySelector('#multiMonitorControls')?.classList.contains('hidden'));
-    const rgbVars = ['r', 'g', 'b'].map((key) => getComputedStyle(document.querySelector(`[data-display="${key}"]`)).getPropertyValue('--range-color').trim());
-    check('rgb-tracks', new Set(rgbVars).size === 3 && rgbVars.every(Boolean));
-    document.querySelector('[data-tab="audio"]')?.click();
-    check('audio-tab', document.querySelector('#view-audio')?.classList.contains('active'));
-    check('audio-advanced-visible', ['audio.echo', 'audio.surround', 'audio.dynamic_boost', 'audio.output_level', 'audio.volume_leveling', 'audio.balance', 'audio.filter_q'].every((path) => { const el = document.querySelector(`[data-bind="${path}"]`); return !!el && el.getBoundingClientRect().height > 0; }));
-    check('quick-toggle-module-colors', new Set(['masterCrosshair', 'masterDisplay', 'masterAudio'].map((id) => getComputedStyle(document.querySelector('#' + id)).getPropertyValue('--module').trim())).size === 3);
-    check('audio-bands', document.querySelectorAll('#bandGrid .fader').length === 10);
-    check('audio-effect-binds', ['audio.bass', 'audio.treble', 'audio.echo', 'audio.surround', 'audio.dynamic_boost', 'audio.output_level', 'audio.volume_leveling', 'audio.balance', 'audio.filter_q'].every((path) => document.querySelector(`[data-bind="${path}"]`)));
-    check('audio-master-range', document.querySelector('[data-bind="audio.output_level"]')?.min === '-20' && document.querySelector('[data-bind="audio.output_level"]')?.max === '20');
-    check('meter-gradient', getComputedStyle(document.querySelector('#meterFill')).backgroundImage.includes('linear-gradient'));
-    check('eq-pchip', typeof window.__crosshairCurveAt === 'function' && Math.abs(window.__crosshairCurveAt({ bands: [0, 0, 6, 0, 0, 0, 0, 0, 0, 0] }, 125) - 6) < 0.01);
-    check('eq-edge-smooth', (() => {
-      const low = { bands: [6, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
-      const high = { bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 6] };
-      return Math.abs(window.__crosshairCurveAt(low, 20) - window.__crosshairCurveAt(low, 21)) > 0.001
-        && Math.abs(window.__crosshairCurveAt(high, 16000) - window.__crosshairCurveAt(high, 19990)) > 0.001;
-    })());
-    check('eq-endpoints-finite', (() => {
-      const low = { bands: [6, 0, 0, 0, 0, 0, 0, 0, 0, 0] };
-      const high = { bands: [0, 0, 0, 0, 0, 0, 0, 0, 0, 6] };
-      return [20, 31, 16000, 20000].every((freq) => {
-        const a = window.__crosshairCurveAt(low, freq);
-        const b = window.__crosshairCurveAt(high, freq);
-        const a2 = window.__crosshairCurveAt(low, freq + 0.001);
-        const b2 = window.__crosshairCurveAt(high, freq + 0.001);
-        return Number.isFinite(a) && Number.isFinite(b) && Number.isFinite(a2) && Number.isFinite(b2)
-          && Math.abs(a - a2) < 0.1 && Math.abs(b - b2) < 0.1;
-      });
-    })());
-    check('eq-stroke', Math.abs(Number(window.__crosshairEqStroke) - 4) < 0.01);
-    const bass = document.querySelector('[data-bind="audio.bass"]');
-    const beforeBass = Number(bass?.value || 0);
-    const testBass = beforeBass >= 10 ? 9 : beforeBass + 1;
-    if (bass) {
-      bass.value = String(testBass);
-      bass.dispatchEvent(new Event('input', { bubbles: true }));
-      window.__crosshairFlushAudio();
-      check('audio-slider-command', window.__lastSent?.type === 'UpdateSound' && Number(window.__lastSent?.payload?.audio?.bass) === testBass);
-      bass.value = String(beforeBass);
-      bass.dispatchEvent(new Event('input', { bubbles: true }));
-      window.__crosshairFlushAudio();
-    } else {
-      check('audio-slider-command', false);
-    }
-    const wideLabels = Array.from(document.querySelectorAll('.fader-label')).map((label) => ({ client: label.clientWidth, scroll: label.scrollWidth }));
-    check('audio-labels', wideLabels.every((entry) => entry.scroll <= entry.client + 1));
-    check('audio-label-font', getComputedStyle(document.querySelector('.fader-label')).fontSize === '13px');
-    check('audio-fader-labels', JSON.stringify(Array.from(document.querySelectorAll('.fader-label')).map((label) => label.textContent)) === JSON.stringify(['Rumble', 'Bass', 'Punch', 'Warmth', 'Body', 'Voice', 'Clarity', 'Treble', 'Sparkle', 'Air']));
-    check('audio-fader-values', Array.from(document.querySelectorAll('.fader-value')).every((value) => getComputedStyle(value).opacity === '1' && /^[+-]?\d+\.\d$/.test(value.textContent.trim())));
-    const band0 = document.querySelector('[data-band="0"]');
-    const band0Before = band0?.value;
-    if (band0) {
-      band0.value = '4';
-      band0.dispatchEvent(new Event('input', { bubbles: true }));
-      const plus = band0.closest('.fader')?.querySelector('.fader-value')?.textContent;
-      band0.value = '-3.5';
-      band0.dispatchEvent(new Event('input', { bubbles: true }));
-      const minus = band0.closest('.fader')?.querySelector('.fader-value')?.textContent;
-      check('audio-fader-value-format', plus === '+4.0' && minus === '-3.5' && band0.getAttribute('aria-valuetext') === '-3.5');
-      band0.value = band0Before;
-      band0.dispatchEvent(new Event('input', { bubbles: true }));
-      window.__crosshairFlushAudio?.();
-    } else {
-      check('audio-fader-value-format', false);
-    }
-    const main = document.querySelector('#main');
-    const mainWidth = main.style.width;
-    main.style.width = '1044px';
-    const narrowLabels = Array.from(document.querySelectorAll('.fader-label')).map((label) => ({ client: label.clientWidth, scroll: label.scrollWidth }));
-    check('audio-labels-narrow', narrowLabels.every((entry) => entry.scroll <= entry.client + 1));
-    labelMetrics = { wide: wideLabels, narrow: narrowLabels };
-    main.style.width = mainWidth;
-    check('no-audio-wall', !document.querySelector('#audioPresets'));
-    check('no-inner-audio-switch', !document.querySelector('#view-audio [data-bind="audio.enabled"]'));
-    check('audio-save-preset', !!document.querySelector('[data-action="save-preset"][data-module="audio"]'));
-    document.querySelector('[data-action="settings"]')?.click();
-    check('settings-open', !document.querySelector('#settingsModal')?.classList.contains('hidden'));
-    const settingsCard = document.querySelector('#settingsModal .modal-card');
-    const settingsCardBox = settingsCard?.getBoundingClientRect();
-    check('settings-card-fits', !!settingsCardBox && settingsCardBox.left >= 0 && settingsCardBox.right <= innerWidth + 1 && settingsCardBox.bottom <= innerHeight + 1);
-    check('settings-card-complete', !!settingsCard && settingsCard.scrollHeight <= settingsCard.clientHeight + 1);
-    check('settings-toggles', document.querySelectorAll('#settingsModal .settings-list .row-toggle').length === 7);
-    check('settings-controls', ['setStartWindows', 'setStartMinimized', 'setMinimizeTray', 'setRestoreDisplay', 'setHotkeys', 'setAutoRevert'].every((id) => document.querySelector('#' + id)));
-    check('module-hotkey-rows', document.querySelectorAll('#settingsModal .hotkey-row').length === 5 && document.querySelector('#setAimHotkey')?.textContent === 'F8' && !!document.querySelector('#setCycleHotkey'));
-    check('settings-hotkey-copy', ['setDisplayHotkey', 'setAudioHotkey', 'setRestoreHotkey', 'setCycleHotkey'].every((id) => document.querySelector('#' + id)?.textContent === 'Set key'));
-    const idleHotkey = document.querySelector('#setDisplayHotkey');
-    idleHotkey?.dispatchEvent(new FocusEvent('focus'));
-    check('settings-hotkey-recording-copy', idleHotkey?.textContent === 'Press key…');
-    idleHotkey?.dispatchEvent(new FocusEvent('blur'));
-    check('settings-hotkey-idle-copy', idleHotkey?.textContent === 'Set key');
-    check('settings-panic-reset', /Panic reset/.test(document.querySelector('#setRestoreHotkey')?.closest('.hotkey-row')?.textContent || '') && /turns Display off/.test(document.querySelector('#setRestoreHotkey')?.closest('.hotkey-row')?.querySelector('span')?.title || ''));
-    const aimHotkey = document.querySelector('#setAimHotkey');
-    aimHotkey?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', altKey: true, bubbles: true, cancelable: true }));
-    check('module-hotkey-capture', window.__lastSent?.type === 'AssignModuleHotkey' && window.__lastSent?.payload?.module === 'aim' && window.__lastSent?.payload?.hotkey === 'Alt+Tab');
-    const minimize = document.querySelector('#setMinimizeTray');
-    const minimizeBefore = minimize.checked;
-    minimize.click();
-    document.querySelector('#settingsModal [data-action="save-settings"]')?.click();
-    check('settings-command', window.__lastSent?.type === 'SettingsChanged' && window.__lastSent?.payload?.settings?.minimizeToTray === !minimizeBefore);
-    document.querySelector('[data-action="settings"]')?.click();
-    const maintenanceGrid = document.querySelector('#settingsModal .maintenance-grid');
-    const maintenanceButtons = Array.from(maintenanceGrid?.querySelectorAll('.button') || []);
-    const maintenanceLabels = maintenanceButtons.map((button) => button.textContent.trim());
-    const maintenanceTops = maintenanceButtons.map((button) => Math.round(button.getBoundingClientRect().top));
-    check('settings-maintenance', maintenanceLabels.length === 6);
-    check('settings-maintenance-grid', !!maintenanceGrid && maintenanceTops.filter((top) => top === maintenanceTops[0]).length === 3 && new Set(maintenanceTops).size === 2);
-    check('settings-maintenance-labels', JSON.stringify(maintenanceLabels) === JSON.stringify(['Open FxSound', 'Refresh Audio', 'Reinstall Audio', 'App Folder', 'Backups', 'Reset All']));
-    check('settings-maintenance-actions', ['open-fxsound', 'unstick-audio', 'repair-audio', 'open-data', 'open-backup', 'factory-reset'].every((action) => maintenanceGrid?.querySelector('[data-action="' + action + '"]')) && !maintenanceGrid?.querySelector('[data-action="open-log"]') && !document.querySelector('#settingsModal [data-action="reset-everything"]') && !document.querySelector('#settingsModal [data-action="erase-settings"]'));
-    const versionLabel = document.querySelector('#versionLabel');
-    const logLink = document.querySelector('#settingsModal .modal-foot [data-action="open-log"]');
-    check('settings-log-link', logLink?.textContent.trim() === 'View logs' && logLink?.previousElementSibling === versionLabel);
-    check('settings-save-label', document.querySelector('#settingsModal [data-action="save-settings"]')?.textContent.trim() === 'Save');
-    document.querySelector('#settingsModal [data-action="unstick-audio"]')?.click();
-    check('unstick-command', window.__lastSent?.type === 'UnstickAudio');
-    // Destructive settings actions confirm in the app's own dialog, not the OS one.
-    const confirmModal = document.querySelector('#confirmModal');
-    window.__crosshairCapture = false;
-    document.querySelector('#settingsModal [data-action="factory-reset"]')?.click();
-    check('confirm-dialog-open', !!confirmModal && !confirmModal.classList.contains('hidden') && document.querySelector('#confirmTitle')?.textContent === 'Reset everything to a clean install?');
-    check('confirm-dialog-no-send', window.__lastSent?.type !== 'FactoryReset');
-    check('confirm-dialog-danger', document.querySelector('#confirmOk')?.classList.contains('danger'));
-    check('confirm-dialog-focus', document.activeElement === document.querySelector('#confirmCancel'));
-    document.querySelector('#confirmModal [data-action="confirm-cancel"]')?.click();
-    check('confirm-dialog-cancel', !!confirmModal && confirmModal.classList.contains('hidden') && window.__lastSent?.type !== 'FactoryReset');
-    confirmAction({ title: 'Self-test confirm', message: 'Body copy', confirm: 'Go' });
-    const okOpen = !!confirmModal && !confirmModal.classList.contains('hidden');
-    document.querySelector('#confirmOk')?.click();
-    check('confirm-dialog-ok', okOpen && window.__crosshairState.confirmOutcome === true && confirmModal.classList.contains('hidden'));
-    confirmAction({ title: 'Self-test cancel' });
-    document.querySelector('#confirmCancel')?.click();
-    check('confirm-dialog-decline', window.__crosshairState.confirmOutcome === false);
-    confirmAction({ title: 'Self-test escape' });
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    check('confirm-dialog-escape', window.__crosshairState.confirmOutcome === false && !!confirmModal && confirmModal.classList.contains('hidden'));
-    window.__crosshairCapture = true;
-    const repairButton = document.querySelector('#settingsModal [data-action="repair-audio"]');
-    const fxMessageBefore = document.querySelector('#fxModalMessage')?.textContent;
-    check('repair-label', repairButton?.textContent.trim() === 'Reinstall Audio');
-    check('repair-tooltip', /Cleanly reinstalls FxSound while preserving your sound settings/.test(repairButton?.title || ''));
-    repairButton?.click();
-    const fxRepairModal = document.querySelector('#fxModal');
-    check('repair-modal', !!fxRepairModal && !fxRepairModal.classList.contains('hidden') && document.querySelector('#fxModalTitle')?.textContent === 'Reinstall FxSound' && (document.querySelector('#fxModalMessage')?.textContent || '').includes('uninstalls and reinstalls') && document.querySelector('#fxInstallButton')?.dataset.action === 'repair-run' && window.__lastSent?.type !== 'RepairAudio');
-    closeFxModal();
-    check('repair-modal-close', !!fxRepairModal && fxRepairModal.classList.contains('hidden'));
-    window.__crosshairState.fxModalMode = 'setup';
-    if (fxMessageBefore != null) document.querySelector('#fxModalMessage').textContent = fxMessageBefore;
-    check('settings-no-long-help', !document.querySelector('#settingsModal .help-copy'));
-    check('settings-short-labels', ['Launch with Windows', 'Start minimized', 'Close to tray', 'Restore display on exit', 'Global hotkeys', 'Auto-revert slots', 'Show in-game notification pill'].every((label) => Array.from(document.querySelectorAll('#settingsModal .settings-list span')).some((span) => span.textContent === label)));
-    check('osd-toast-toggle', !!document.querySelector('#setOsdToast'));
-    check('blue-light-toggle', !!document.querySelector('#blueLightToggle') && document.querySelector('#blueLightToggle')?.getAttribute('aria-pressed') !== null);
-    document.querySelector('#settingsModal [data-action="close-settings"]')?.click();
-    check('settings-close', document.querySelector('#settingsModal')?.classList.contains('hidden'));
-    document.querySelector('#settingsModal [data-action="open-backup"]')?.click();
-    check('backup-modal', !document.querySelector('#backupModal')?.classList.contains('hidden') && window.__lastSent?.type === 'BackupModalOpen');
-    check('backup-actions', ['backup-create', 'backup-browse', 'backup-restore', 'backup-undo'].every((action) => document.querySelector('#backupModal [data-action="' + action + '"]')));
-    document.querySelector('#backupModal [data-action="close-backup-modal"]')?.click();
-    check('backup-close', document.querySelector('#backupModal')?.classList.contains('hidden'));
-    document.querySelector('[data-tab="audio"]')?.click();
-    check('fx-copy-short', (() => {
-      const copy = (document.querySelector('#fxModalMessage')?.textContent || '').trim();
-      return !(document.querySelector('#fxModal')?.textContent || '').includes('Audio engine')
-        && (/^Install FxSound to enable live sound controls\.$/.test(copy)
-          || /^FxSound .* is available\.$/.test(copy)
-          || /^FxSound .* needs updating for live control\.$/.test(copy));
-    })());
-    check('animation-controls', (document.querySelector('#gifOptions .row-toggle span')?.textContent || '') === 'Animation playback' && !document.body.textContent.includes('GIF playback'));
-    check('flatten-eq-action', (document.querySelector('#importStatus [data-action="flatten-eq"]')?.textContent || '').includes('Apply imported curve to sliders'));
-    document.querySelector('[data-tab="slots"]')?.click();
-    const cards = Array.from(document.querySelectorAll('.slot-card'));
-    const switchesBefore = Number(window.__crosshairSlotSwitches || 0);
-    cards[0]?.click();
-    cards[1]?.click();
-    check('slot-editor', ((document.querySelector('#slotName')?.value) || '').length > 0);
-    check('slot-command', window.__lastSent?.type === 'ActivateSlot');
-    check('slot-rapid-single-command', Number(window.__crosshairSlotSwitches || 0) === switchesBefore + 1);
-    check('slot-toggle-command', cards[0] && window.__crosshairLastActivation !== undefined);
-    check('slot-count', document.querySelectorAll('.slot-card').length === 3);
-    check('slot-active-whole-card', (() => { const active = document.querySelector('.slot-card.active'); return !!active && getComputedStyle(active).backgroundColor === 'rgba(182, 146, 255, 0.16)'; })());
-    check('no-activate-button', !document.body.innerText.includes('Deactivate') && !/\bActivate\b/.test(document.querySelector('#slotEditor')?.innerText || ''));
-    check('custom-dropdowns', document.querySelectorAll('#slotEditor .custom-trigger').length === 4);
-    document.querySelector('#slotTarget')?.click();
-    check('custom-dropdown-open', document.querySelector('#slotTarget')?.getAttribute('aria-expanded') === 'true' && !document.querySelector('#slotTarget + .custom-menu')?.classList.contains('hidden'));
-    check('custom-dropdown-no-scroll', Array.from(document.querySelectorAll('.custom-menu:not(.hidden)')).every((menu) => menu.scrollHeight <= menu.clientHeight + 1));
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
-    check('menu-escape', document.querySelector('#slotTarget')?.getAttribute('aria-expanded') === 'false' && document.querySelector('#slotTarget + .custom-menu')?.classList.contains('hidden'));
-    check('games-entry', !!document.querySelector('[data-action="open-games"]'));
-    document.querySelector('[data-action="open-games"]')?.click();
-    check('games-modal', !document.querySelector('#gamesModal')?.classList.contains('hidden') && window.__lastSent?.type === 'ScanGames');
-    check('games-modal-list', /No games found|Scanning/.test(document.querySelector('#gamesList')?.textContent || ''));
-    document.querySelector('#gamesModal [data-action="close-games"]')?.click();
-    check('games-modal-close', document.querySelector('#gamesModal')?.classList.contains('hidden'));
-    document.querySelector('[data-action="open-games"]')?.click();
-    window.__crosshair_onMessage({ v: 1, type: 'InstalledGames', payload: { games: [], timedOut: true } });
-    check('games-modal-timeout-copy', /took too long/i.test(document.querySelector('#gamesList')?.textContent || '') && /Rescan/.test(document.querySelector('#gamesList')?.textContent || ''));
-    window.__crosshair_onMessage({ v: 1, type: 'InstalledGames', payload: { games: [], timedOut: false } });
-    document.querySelector('#gamesModal [data-action="close-games"]')?.click();
-    check('no-save-slot', !document.querySelector('[data-action="save-slot"]') && !document.body.innerText.includes('SAVE SLOT'));
-    document.querySelector('[data-action="open-emoji"]')?.click();
-    check('emoji-picker', document.querySelectorAll('.emoji-button').length === 64);
-    check('emoji-grid-size', getComputedStyle(document.querySelector('.emoji-grid')).gridTemplateColumns.split(' ').length === 8 && Math.round(document.querySelector('.emoji-button')?.getBoundingClientRect().height || 0) === 34);
-    document.querySelector('#emojiModal [data-action="close-emoji-modal"]')?.click();
-    document.querySelector('[data-tab="aim"]')?.click();
-    // Neutral bidirectional sliders must look untouched: fill between the
-    // slider's own zero mark and the value, not from the left edge.
-    const fillProbe = (selector, probeValue) => {
-      const input = document.querySelector(selector);
-      if (!input) return null;
-      const before = input.value;
-      input.value = String(probeValue);
-      setRangeFill(input);
-      const lo = parseFloat(input.style.getPropertyValue("--fill-lo"));
-      const hi = parseFloat(input.style.getPropertyValue("--fill-hi"));
-      input.value = before;
-      setRangeFill(input);
-      return [lo, hi];
-    };
-    const brightnessFill = fillProbe('[data-display="brightness"]', 0);
-    check('slider-fill-neutral', !!brightnessFill && brightnessFill[0] === 50 && brightnessFill[1] === 50);
-    const contrastFill = fillProbe('[data-display="contrast"]', 0);
-    check('slider-fill-zero-offset', !!contrastFill && Math.abs(contrastFill[0] - 42.857142857) < 0.01 && Math.abs(contrastFill[1] - 42.857142857) < 0.01);
-    const gainFill = fillProbe('[data-bind="audio.output_level"]', 0);
-    check('slider-fill-bipolar', !!gainFill && gainFill[0] === 50 && gainFill[1] === 50);
-    check('no-vertical-scroll', document.documentElement.scrollHeight <= innerHeight + 1);
-    check('no-pane-scroll', Array.from(document.querySelectorAll('.preset-menu, .custom-menu, .emoji-grid, .modal-card')).every((el) => el.classList.contains('hidden') || el.scrollHeight <= el.clientHeight + 1));
-    // A load-time EQ cleanup banner has to reach the user as a visible toast; the
-    // Rust test only proves the event is emitted, not that the page displays it.
-    const toast = document.querySelector('#toast');
-    const cleanupText = "The sound profile 'Hand edited' was not applied because its preamp is not a valid number.";
-    window.__crosshair_onMessage({ v: 1, type: 'DiagnosticBanner', payload: { code: 'eq', message: cleanupText, recoverable: true } });
-    check('eq-cleanup-toast', !!toast && !toast.classList.contains('hidden') && toast.textContent === cleanupText);
-    check('eq-cleanup-toast-error', !!toast && toast.classList.contains('error'));
-    const toastBox = toast.getBoundingClientRect();
-    const settingsBox = document.querySelector('.statusbar-settings')?.getBoundingClientRect();
-    const tabsRect = document.querySelector('.tabs')?.getBoundingClientRect();
-    const topbarRect = document.querySelector('.topbar')?.getBoundingClientRect();
-    check('toast-in-tab-row', !!topbarRect && toastBox.top >= topbarRect.top - 1 && toastBox.bottom <= topbarRect.bottom + 1 && Math.round(innerWidth - toastBox.right) === 24);
-    check('toast-clear-of-tabs', !!tabsRect && (toastBox.left >= tabsRect.right || toastBox.right <= tabsRect.left || toastBox.bottom <= tabsRect.top || toastBox.top >= tabsRect.bottom));
-    check('toast-clear-of-settings', !!settingsBox && (toastBox.bottom <= settingsBox.top || toastBox.right <= settingsBox.left));
-    check('toast-full-text-title', toast.title === cleanupText);
-    window.__crosshair_onMessage({ v: 1, type: 'DiagnosticBanner', payload: { code: 'audio_notice', message: 'FxSound reinstalled.', recoverable: true } });
-    check('audio-notice-success-toast', !toast.classList.contains('error') && toast.textContent === 'FxSound reinstalled.');
-    window.__crosshair_onMessage({ v: 1, type: 'DiagnosticBanner', payload: { code: 'audio_notice', message: 'Reinstall failed.', recoverable: true } });
-    check('audio-notice-error-toast', toast.classList.contains('error'));
-    check('eq-cleanup-toast-single', document.querySelectorAll('.toast').length === 1);
-    // Reporting the same cleanup twice refreshes the one toast instead of stacking.
-    window.__crosshair_onMessage({ v: 1, type: 'DiagnosticBanner', payload: { code: 'eq', message: cleanupText, recoverable: true } });
-    check('eq-cleanup-toast-no-stack', document.querySelectorAll('.toast').length === 1 && !!toast && toast.textContent === cleanupText && !toast.classList.contains('hidden'));
-    toast.classList.add('hidden');
-    document.querySelector('#settingsModal [data-action="close-settings"]')?.click();
-    const contentFits = (tab) => {
-      window.__crosshair_setTab(tab);
-      const content = document.querySelector('#view-' + tab + ' .content');
-      return !!content && content.scrollHeight <= content.clientHeight + 1;
-    };
-    // A loaded image shows the option stack; a GIF plus tint/solid shows the
-    // tallest variant. Force every conditional block visible for the measure so
-    // an empty dropzone can never hide an overflow again.
-    const imageWorstCaseFits = () => {
-      const forced = ['#imageOptions', '#solidColorRow', '#gifOptions'].map((selector) => document.querySelector(selector));
-      const classes = forced.map((el) => (el ? el.className : null));
-      forced.forEach((el) => el?.classList.remove('hidden'));
-      const fits = contentFits('aim');
-      forced.forEach((el, index) => { if (el) el.className = classes[index]; });
-      return fits;
-    };
-    window.__crosshair_setTab('aim');
-    document.querySelector('[data-action="aim-mode"][data-value="shape"]')?.click();
-    check('no-scroll-aim-shape', contentFits('aim'));
-    document.querySelector('[data-action="aim-mode"][data-value="image"]')?.click();
-    check('no-scroll-aim-image', contentFits('aim'));
-    check('no-scroll-aim-image-loaded', imageWorstCaseFits());
-    document.querySelector('[data-action="aim-mode"][data-value="shape"]')?.click();
-    window.__crosshair_setTab('display');
-    const displayMore = document.querySelector('#displayMore');
-    if (displayMore) displayMore.open = false;
-    check('no-scroll-display-collapsed', contentFits('display'));
-    if (displayMore) displayMore.open = true;
-    check('no-scroll-display-expanded', contentFits('display'));
-    if (displayMore) displayMore.open = false;
-    window.__crosshair_setTab('audio');
-    const audioMore = document.querySelector('#audioMore');
-    if (audioMore) audioMore.open = false;
-    check('no-scroll-audio-collapsed', contentFits('audio'));
-    if (audioMore) audioMore.open = true;
-    check('no-scroll-audio-expanded', contentFits('audio'));
-    if (audioMore) audioMore.open = false;
-    check('no-scroll-slots', contentFits('slots'));
-  } catch (error) {
-    errors.push('exception:' + String(error));
-  }
-  return JSON.stringify({ ok: errors.length === 0, errors, width: innerWidth, height: innerHeight, dpr: devicePixelRatio, previewWidth: document.querySelector('#aimPreview')?.naturalWidth || 0, labelMetrics });
-})()"#;
+const STRESS_JS: &str = include_str!("../ui/harness/stress.js");
+const SELFTEST_JS: &str = include_str!("../ui/harness/selftest.js");
 const LAYOUT_JS: &str = r#"(() => {
   const errors = [];
   let settingsMetrics = null;
@@ -4410,12 +4434,6 @@ const LAYOUT_JS: &str = r#"(() => {
     check('display-visible', document.querySelector('#view-display')?.classList.contains('active'));
     const card = document.querySelector('#view-display .content .card')?.getBoundingClientRect();
     check('display-card-fits', !!card && card.left >= 0 && card.right <= innerWidth + 1);
-    const narrowVis = document.querySelector('#aimVisibility');
-    const narrowVisLabel = document.querySelector('.aim-visibility .aim-visibility-label');
-    check('aim-visibility-fits-1040', !!narrowVis && !!narrowVisLabel
-      && narrowVisLabel.getBoundingClientRect().bottom <= narrowVis.getBoundingClientRect().top + 1
-      && narrowVis.scrollWidth <= narrowVis.clientWidth + 1
-      && Array.from(narrowVis.querySelectorAll('.seg')).every((el) => el.scrollWidth <= el.clientWidth + 1));
     check('blue-light', !!document.querySelector('#blueLightToggle'));
     check('compare-display', !!document.querySelector('#compareDisplay'));
     document.querySelector('[data-action="settings"]')?.click();
@@ -4430,7 +4448,7 @@ const LAYOUT_JS: &str = r#"(() => {
     const labels = gridButtons.map((button) => button.textContent.trim());
     const tops = gridButtons.map((button) => Math.round(button.getBoundingClientRect().top));
     check('settings-grid-3x2', !!grid && tops.filter((top) => top === tops[0]).length === 3 && new Set(tops).size === 2);
-    check('settings-grid-labels', JSON.stringify(labels) === JSON.stringify(['Open FxSound', 'Refresh Audio', 'Reinstall Audio', 'App Folder', 'Backups', 'Reset All']));
+    check('settings-grid-labels', JSON.stringify(labels) === JSON.stringify(['Open FxSound', 'Fix audio', 'Reinstall FxSound', 'App Folder', 'Backups', 'Reset app']));
     check('settings-footer-link', document.querySelector('#settingsModal .modal-foot [data-action="open-log"]')?.previousElementSibling?.id === 'versionLabel');
     check('settings-save', document.querySelector('#settingsModal [data-action="save-settings"]')?.textContent.trim() === 'Save');
     check('settings-cycle-hotkey', !!document.querySelector('#setCycleHotkey'));
@@ -4455,11 +4473,45 @@ const LAYOUT_JS: &str = r#"(() => {
     };
     window.__crosshair_setTab('aim');
     document.querySelector('[data-action="aim-mode"][data-value="shape"]')?.click();
+    document.querySelector('[data-action="aim-visibility"][data-value="hide"]')?.click();
+    const aimView = document.querySelector('#view-aim');
+    const aimRail = aimView?.querySelector('.rail');
+    const aimBehavior = document.querySelector('#aimVisibility')?.closest('.card');
+    const aimRow = document.querySelector('#aimButtonRow');
+    const aimSelect = document.querySelector('#aimButton');
+    const aimSelectWrap = document.querySelector('#aimButtonSelect');
+    const aimMenu = document.querySelector('#aimButtonMenu');
+    const aimTrack = document.querySelector('#aimVisibility');
+    const aimViewBox = aimView?.getBoundingClientRect();
+    const aimRailBox = aimRail?.getBoundingClientRect();
+    const aimBehaviorBox = aimBehavior?.getBoundingClientRect();
+    const aimRowBox = aimRow?.getBoundingClientRect();
+    const aimTrackBox = aimTrack?.getBoundingClientRect();
+    check('aim-button-row-visible-1040', !!aimRow && !aimRow.classList.contains('hidden') && !!aimRowBox && aimRowBox.height > 0);
+    check('aim-button-row-inside', !!aimRowBox && !!aimBehaviorBox && aimRowBox.left >= aimBehaviorBox.left - 1 && aimRowBox.right <= aimBehaviorBox.right + 1 && aimRowBox.bottom <= aimBehaviorBox.bottom + 1);
+    check('aim-button-select-fits-1040', !!aimSelect && !!aimSelectWrap && !!aimBehaviorBox
+      && aimSelectWrap.scrollWidth <= aimSelectWrap.clientWidth + 1
+      && aimSelect.getBoundingClientRect().right <= aimBehaviorBox.right + 1
+      && aimSelect.getBoundingClientRect().right <= aimSelectWrap.getBoundingClientRect().right + 1);
+    aimSelect?.click();
+    const aimMenuBox = aimMenu?.getBoundingClientRect();
+    check('aim-button-menu-fits-1040', !!aimMenu && !aimMenu.classList.contains('hidden') && !!aimMenuBox
+      && aimMenuBox.left >= -1 && aimMenuBox.top >= -1
+      && aimMenuBox.right <= innerWidth + 1 && aimMenuBox.bottom <= innerHeight + 1);
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+    check('aim-button-menu-closed-1040', !!aimMenu && aimMenu.classList.contains('hidden') && aimSelect?.getAttribute('aria-expanded') === 'false');
+    check('aim-visibility-fits-1040', !!aimTrack && !!aimTrackBox && !!aimBehaviorBox && aimTrackBox.right <= aimBehaviorBox.right + 1
+      && aimTrack.scrollWidth <= aimTrack.clientWidth + 1
+      && Array.from(aimTrack.querySelectorAll('.seg')).every((el) => el.scrollWidth <= el.clientWidth + 1 && el.getBoundingClientRect().bottom <= aimTrackBox.bottom + 1));
+    check('aim-behavior-fits-1040', !!aimBehaviorBox && !!aimRailBox && aimBehaviorBox.bottom <= aimRailBox.bottom + 1);
+    check('aim-rail-no-scroll', !!aimRail && aimRail.scrollHeight <= aimRail.clientHeight + 1);
     check('no-scroll-aim-shape', contentFits('aim'));
     document.querySelector('[data-action="aim-mode"][data-value="image"]')?.click();
     check('no-scroll-aim-image', contentFits('aim'));
     check('no-scroll-aim-image-loaded', imageWorstCaseFits());
     document.querySelector('[data-action="aim-mode"][data-value="shape"]')?.click();
+    document.querySelector('[data-action="aim-visibility"][data-value="always"]')?.click();
+    check('aim-button-row-hidden-restored', !!aimRow && aimRow.classList.contains('hidden'));
     window.__crosshair_setTab('display');
     const displayMore = document.querySelector('#displayMore');
     if (displayMore) displayMore.open = false;
@@ -4501,6 +4553,12 @@ fn protocol_response(path: &str, cache: &Arc<Mutex<PreviewCache>>) -> wry::http:
                 (200, "image/png", Cow::Owned(png))
             }
         }
+        other if other.starts_with("/crosshair-image/") => {
+            match stored_image_request(other.trim_start_matches("/crosshair-image/")) {
+                Some((content_type, bytes)) => (200, content_type, Cow::Owned(bytes)),
+                None => (404, "text/plain", Cow::Borrowed(b"not found".as_slice())),
+            }
+        }
         other if other.starts_with("/assets/presets/") => {
             let style = other.trim_start_matches("/assets/presets/").trim_end_matches(".png");
             if ["plus", "dot", "ring", "circle_dot", "tsight", "triangle", "peak"].contains(&style) {
@@ -4517,6 +4575,56 @@ fn protocol_response(path: &str, cache: &Arc<Mutex<PreviewCache>>) -> wry::http:
         .header("Cache-Control", "no-store")
         .body(body)
         .unwrap_or_else(|_| wry::http::Response::new(Cow::Borrowed(b"error".as_slice())))
+}
+
+/// Decode the percent-encoded file name in a Recent-image URL. Null bytes,
+/// separators and traversal are rejected later by `stored_image_path_in`.
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn image_content_type(name: &str) -> &'static str {
+    match Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        Some("ico") => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+/// A thumbnail request reads one stored crosshair image from the data folder.
+/// The same size cap as the importer keeps a stray huge file out of memory.
+fn stored_image_request(encoded: &str) -> Option<(&'static str, Vec<u8>)> {
+    let name = percent_decode(encoded)?;
+    let path = config::stored_image_path_in(&config::crosshairs_dir(), &name)?;
+    let meta = std::fs::metadata(&path).ok()?;
+    if !import_size_allowed(meta.len()) {
+        return None;
+    }
+    let bytes = std::fs::read(&path).ok()?;
+    Some((image_content_type(&name), bytes))
 }
 
 /// Turns the problems a config load or a restore undo had to clean up into one
@@ -4627,12 +4735,28 @@ fn import_size_allowed(bytes: u64) -> bool {
 
 fn image_extension_supported(path: &Path) -> bool {
     let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
-    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "bmp" | "ico")
+    config::IMAGE_EXTENSIONS.contains(&ext.as_str())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_payload_carries_the_live_image_state() {
+        let mut crosshair = crate::config::CrosshairConfig::default();
+        crosshair.image = Some("C:/data/crosshairs/123-imported.png".into());
+        crosshair.image_name = Some("imported.png".into());
+        let input = overlay_input(&crosshair, Some((0, 0, 1920, 1080)), Vec::new(), "test".into());
+        assert_eq!(input.config.image, crosshair.image, "the overlay payload must carry a newly imported image");
+        assert_eq!(input.config.image_name, crosshair.image_name);
+
+        crosshair.image = None;
+        crosshair.image_name = None;
+        let input = overlay_input(&crosshair, Some((0, 0, 1920, 1080)), Vec::new(), "test".into());
+        assert!(input.config.image.is_none(), "the overlay payload must carry a removed image");
+        assert!(input.config.image_name.is_none());
+    }
 
     #[test]
     fn automated_modes_have_no_live_display_audio_or_startup_paths() {
@@ -4714,7 +4838,10 @@ mod tests {
             source.matches("self.sandbox_blocked(\"display restore\")").count() >= 3,
             "suspend, logoff and reset must all use the central display-restore gate"
         );
-        assert_eq!(source.matches(concat!("self.audio.refresh(", "true)")).count(), 1, "there is exactly one forced FxSound refresh, and it is gated");
+        // Startup probes, the Sound tab and factory reset each force one
+        // refresh; every one sits behind `live_system`.
+        assert_eq!(source.matches(concat!("self.audio.refresh(", "true)")).count(), 3, "the forced FxSound refreshes must stay accounted for");
+        assert!(source.matches(concat!("if self.modes().live_", "system()")).count() >= 4, "every forced FxSound refresh must use the live-system gate");
         assert!(source.contains("sandbox: tray skipped; no real shell icon"), "automated runs must not create a real tray icon");
         assert!(source.contains("sandbox: {} picker skipped; real dialog untouched"), "automated runs must not open native file pickers");
         assert!(source.contains("sandbox: backup create skipped; real files untouched"), "capture must not create backup archives");
@@ -4726,8 +4853,12 @@ mod tests {
             "verify/fxverify/capture must not publish an overlay"
         );
         assert!(
-            source.contains("if !self.modes().live_system() || !self.config.settings.auto_revert_slots"),
+            source.contains("if !self.modes().live_system() {") && source.contains("slots::auto_activate_for_app"),
             "harnesses must not auto-switch slots from the foreground watcher"
+        );
+        assert!(
+            source.contains("self.config.settings.auto_revert_slots && slots::active_target_stopped"),
+            "the revert setting must gate only reverting, never activation"
         );
     }
 
@@ -4944,11 +5075,11 @@ mod tests {
         let expected = run_key_value(&std::env::current_exe().unwrap());
 
         let enabled = Settings { start_with_windows: true, ..Default::default() };
-        apply_run_key_at(&enabled, &subkey);
+        assert!(apply_run_key_at(&enabled, &subkey).is_ok(), "the test Run key must be writable");
         assert_eq!(read_run_key_at(&subkey).unwrap().as_deref(), Some(expected.as_str()));
 
         let disabled = Settings { start_with_windows: false, ..Default::default() };
-        apply_run_key_at(&disabled, &subkey);
+        assert!(apply_run_key_at(&disabled, &subkey).is_ok());
         assert_eq!(read_run_key_at(&subkey).unwrap(), None);
     }
 
@@ -5075,6 +5206,18 @@ mod tests {
         for path in ["a.exe", "a.txt", "a"] {
             assert!(!image_extension_supported(Path::new(path)), "{path}");
         }
+    }
+
+    #[test]
+    fn crosshair_image_route_decodes_names_and_rejects_traversal() {
+        assert_eq!(percent_decode("1700-aim%20shot.PNG").as_deref(), Some("1700-aim shot.PNG"));
+        assert_eq!(percent_decode("na%C3%AFve.png").as_deref(), Some("naïve.png"));
+        assert!(percent_decode("%ZZ").is_none());
+        assert!(percent_decode("%2").is_none());
+        assert!(percent_decode("..%2Fsecret.png").as_deref() == Some("../secret.png"));
+        assert!(stored_image_request("..%2Fsecret.png").is_none(), "a decoded separator must never reach a file read");
+        assert_eq!(image_content_type("a.GIF"), "image/gif");
+        assert_eq!(image_content_type("a.webp"), "image/webp");
     }
 
     #[test]

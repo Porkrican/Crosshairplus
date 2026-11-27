@@ -632,11 +632,6 @@ pub fn version_is_newer(latest: &str, installed: &str) -> bool {
     parts(latest) > parts(installed)
 }
 
-/// Ask FxSound 1.2.11+ to refresh `status.json` before the safety baseline is captured.
-pub fn prime_status() {
-    let _ = refresh_status();
-}
-
 fn status_args() -> Vec<String> {
     ["--run_minimized", "--status"].iter().map(|arg| (*arg).to_string()).collect()
 }
@@ -1234,11 +1229,35 @@ pub fn open_fxsound() -> Result<(), String> {
     Ok(())
 }
 
+/// Run a helper process with a hard deadline. `Command::output` has no
+/// timeout, and a stuck winget or PowerShell otherwise parks the audio worker
+/// (and the installer modal) forever.
+fn command_output_bounded(command: &mut Command, timeout: Duration) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().map_err(|e| e.to_string()),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {}s", timeout.as_secs()));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return Err(e.to_string());
+            }
+        }
+    }
+}
+
 fn run_winget(args: &[&str]) -> Result<(), String> {
-    let output = Command::new("winget")
-        .args(args)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    let mut command = Command::new("winget");
+    command.args(args).creation_flags(CREATE_NO_WINDOW);
+    let output = command_output_bounded(&mut command, Duration::from_secs(600))
         .map_err(|e| format!("winget is unavailable: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1250,10 +1269,9 @@ fn run_winget(args: &[&str]) -> Result<(), String> {
 }
 
 pub fn winget_available() -> bool {
-    Command::new("winget")
-        .arg("--version")
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+    let mut command = Command::new("winget");
+    command.arg("--version").creation_flags(CREATE_NO_WINDOW);
+    command_output_bounded(&mut command, Duration::from_secs(15))
         .map(|output| output.status.success())
         .unwrap_or(false)
 }
@@ -1357,21 +1375,20 @@ fn version_from_release(value: &Value) -> Option<String> {
 }
 
 fn http_text(url: &str) -> Result<String, String> {
-    if let Ok(output) = Command::new("curl.exe")
-        .args(["-fsSL", "--max-time", "20", url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
+    let mut curl = Command::new("curl.exe");
+    curl.args(["-fsSL", "--max-time", "20", url]).creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = command_output_bounded(&mut curl, Duration::from_secs(30)) {
         if output.status.success() && !output.stdout.is_empty() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
     }
     let escaped = url.replace('\'', "''");
     let script = format!("(Invoke-WebRequest -UseBasicParsing -Uri '{escaped}' -TimeoutSec 20).Content");
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command_output_bounded(&mut command, Duration::from_secs(30))
         .map_err(|e| format!("HTTP unavailable: {e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -1388,11 +1405,9 @@ pub fn latest_release_version() -> Option<String> {
 }
 
 fn sha256_file(path: &Path) -> Option<String> {
-    let output = Command::new("certutil")
-        .args(["-hashfile", &path.to_string_lossy(), "SHA256"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .ok()?;
+    let mut command = Command::new("certutil");
+    command.args(["-hashfile", &path.to_string_lossy(), "SHA256"]).creation_flags(CREATE_NO_WINDOW);
+    let output = command_output_bounded(&mut command, Duration::from_secs(30)).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1408,11 +1423,10 @@ fn download_file(url: &str, path: &Path) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let path_text = path.to_string_lossy().to_string();
-    if let Ok(output) = Command::new("curl.exe")
-        .args(["-fL", "--retry", "2", "--max-time", "300", "-o", &path_text, url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
+    let mut curl = Command::new("curl.exe");
+    curl.args(["-fL", "--retry", "2", "--max-time", "300", "-o", &path_text, url])
+        .creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = command_output_bounded(&mut curl, Duration::from_secs(330)) {
         if output.status.success() && path.exists() {
             return Ok(());
         }
@@ -1422,10 +1436,11 @@ fn download_file(url: &str, path: &Path) -> Result<(), String> {
     let script = format!(
         "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -Uri '{escaped_url}' -OutFile '{escaped_path}' -TimeoutSec 300"
     );
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command_output_bounded(&mut command, Duration::from_secs(330))
         .map_err(|e| format!("download failed: {e}"))?;
     if !output.status.success() || !path.exists() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
@@ -1469,21 +1484,22 @@ fn run_installer_with(path: &Path, args: &[&str]) -> Result<(), String> {
         powershell_quote(&path.to_string_lossy()),
         arguments
     );
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .creation_flags(CREATE_NO_WINDOW);
+    let output = command_output_bounded(&mut command, Duration::from_secs(900))
         .map_err(|e| format!("The installer could not be started: {e}"))?;
     if output.status.success() {
         return Ok(());
     }
     // Fallback for systems where the PowerShell elevation shim is unavailable.
     if args == installer_args() {
-        let status = Command::new(path)
-            .args(args)
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-            .map_err(|e| format!("The installer could not be started: {e}"))?;
+        let mut installer = Command::new(path);
+        installer.args(args).creation_flags(CREATE_NO_WINDOW);
+        let status = command_output_bounded(&mut installer, Duration::from_secs(900))
+            .map_err(|e| format!("The installer could not be started: {e}"))?
+            .status;
         if status.success() {
             return Ok(());
         }
@@ -1799,6 +1815,55 @@ mod tests {
         assert_eq!(disabled.args, vec!["--power=0".to_string(), "--run_minimized".to_string()]);
         assert!(!disabled.args.iter().any(|a| a.starts_with("--set_band_gain=")), "sound off must not rewrite a preset");
         assert!(!disabled.args.iter().any(|a| a.starts_with("--set_effect=")), "sound off must not rewrite effects");
+    }
+
+    #[test]
+    fn compare_payload_is_flat_but_keeps_fxsound_powered_on() {
+        let audio = AudioConfig {
+            enabled: true,
+            device: Some("Headphones".into()),
+            bands: [6.0; 10],
+            bass: 7.0,
+            treble: 8.0,
+            output_level: 5.0,
+            echo: 6.0,
+            surround: 4.0,
+            dynamic_boost: 3.0,
+            volume_leveling: 2.0,
+            balance: -6.0,
+            filter_q: 1.5,
+            volume_guard: true,
+            imported: Some(crate::config::ImportedProfile {
+                name: "Imported".into(),
+                raw: String::new(),
+                bands: Vec::new(),
+                parametric: false,
+                preamp: 4.0,
+            }),
+            active_preset: Some("harman".into()),
+        };
+        let flat = crate::audio::dsp_math::flat_compare(&audio);
+        assert!(flat.enabled, "compare keeps the endpoint powered");
+        assert_eq!(flat.device.as_deref(), Some("Headphones"));
+        assert_eq!(flat.filter_q, 1.5, "keep Q so the bands are not re-centered");
+        assert!(flat.imported.is_none(), "the imported curve is part of what compare bypasses");
+
+        let call = build_call(&flat, 10, 1.5);
+        assert!(call.args.iter().any(|arg| arg == "--power=1"));
+        assert!(!call.args.iter().any(|arg| arg == "--power=0"), "compare must never power the endpoint off");
+        assert_eq!(
+            call.args.iter().find(|arg| arg.starts_with("--set_band_gain=")).map(String::as_str),
+            Some("--set_band_gain=0:0.00,1:0.00,2:0.00,3:0.00,4:0.00,5:0.00,6:0.00,7:0.00,8:0.00,9:0.00")
+        );
+        assert!(call.args.iter().any(|arg| arg == "--master_gain=0.00"));
+        assert!(call.args.iter().any(|arg| arg == "--volume_leveling=0.0"));
+        assert!(call.args.iter().any(|arg| arg == "--balance=0"));
+        assert!(call
+            .args
+            .iter()
+            .any(|arg| arg == "--set_effect=bass:0.0,clarity:0.0,ambience:0.0,surround:0.0,dynamicboost:0.0"));
+        assert!(!call.args.iter().any(|arg| arg.starts_with("--filter_q=")));
+        assert!(call.args.iter().any(|arg| arg == "--run_minimized"));
     }
 
     #[test]

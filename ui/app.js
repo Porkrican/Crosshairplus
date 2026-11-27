@@ -10,6 +10,7 @@ const S = {
   gamesScanning: false,
   gamesTimedOut: false,
   crosshairPresets: [],
+  crosshairImages: [],
   displayPresets: [],
   audioPresets: [],
   selectedSlot: null,
@@ -19,6 +20,9 @@ const S = {
   lut: null,
   lutObjectUrl: null,
   lutMirrorToken: 0,
+  sceneSource: null,
+  lutKey: null,
+  hotkeyConflicts: {},
   warning: null,
   applied: false,
   meterPeak: 0,
@@ -33,8 +37,11 @@ const S = {
   awaitingBrowseSlot: null,
   aimMode: "shape",
   aimModeInitialized: false,
+  pendingStoredImage: null,
+  recentLoading: false,
   lastWarmth: 40,
   compareActive: false,
+  compareAudioActive: false,
   presetMenu: null,
   customSelect: null,
   fxModalShown: false,
@@ -61,13 +68,32 @@ const EMOJIS = [
 ];
 const FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
 const FADERS = [
-  ["🌊", "Rumble"], ["🔊", "Bass"], ["🥊", "Punch"], ["🔥", "Warmth"], ["🫀", "Body"],
-  ["🎤", "Voice"], ["💎", "Clarity"], ["✨", "Treble"], ["⚡", "Sparkle"], ["🪽", "Air"],
+  ["🌊", "Sub", "Adds weight below 60 Hz."],
+  ["🔊", "Bass", "Boosts the low punch."],
+  ["🥊", "Punch", "Emphasizes kick and impact."],
+  ["🔥", "Body", "Fills out drums and guitars."],
+  ["🫀", "Warm", "Adds warmth; too much sounds boxy."],
+  ["🎤", "Voice", "Brings voices forward."],
+  ["💎", "Clarity", "Sharpens detail."],
+  ["✨", "Detail", "Lifts footsteps and strings."],
+  ["⚡", "Sizzle", "Adds sparkle; use sparingly."],
+  ["🪽", "Air", "Opens the top end."],
 ];
 const PANELS = [["auto", "Auto"], ["led", "LED"], ["oled", "OLED"], ["ips", "IPS"], ["va", "VA"], ["miniled", "MiniLED"], ["tn", "TN"]];
 const DISPLAY_PRESET_FIELDS = ["brightness", "contrast", "gamma", "warmth", "r", "g", "b"];
+const AIM_BUTTONS = ["right", "left", "middle", "mouse4", "mouse5"];
 
 const $ = (sel) => document.querySelector(sel);
+
+// One label function for both recorders. Space is a single-character key, so
+// testing `length === 1` before it turned it into an unusable " " shortcut.
+function hotkeyKeyName(key) {
+  if (key === " ") return "Space";
+  if (key.length === 1) return key.toUpperCase();
+  if (key.startsWith("Arrow")) return key.slice(5);
+  return key.charAt(0).toUpperCase() + key.slice(1);
+}
+window.__crosshairHotkeyKeyName = hotkeyKeyName;
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const clone = (value) => JSON.parse(JSON.stringify(value));
@@ -178,6 +204,48 @@ function renderBackupSummary(preview) {
     + (preview.warnings?.length ? `<div class="warn">${preview.warnings.map(esc).join("<br>")}</div>` : "");
   restore?.classList.remove("hidden");
 }
+
+// OLED tooltips: one fixed node, delegated from any [data-tip]. Nothing is
+// added to the card flow, so the zero-scroll layout cannot shift.
+function hideTooltip() {
+  $("#tooltip")?.classList.add("hidden");
+}
+
+function placeTooltip(target) {
+  const tip = target?.dataset?.tip;
+  const el = $("#tooltip");
+  if (!tip || !el) return hideTooltip();
+  el.textContent = tip;
+  el.classList.remove("hidden");
+  const box = target.getBoundingClientRect();
+  const tipBox = el.getBoundingClientRect();
+  const margin = 8;
+  let left = box.left + box.width / 2 - tipBox.width / 2;
+  left = Math.max(margin, Math.min(window.innerWidth - tipBox.width - margin, left));
+  let top = box.top - tipBox.height - 8;
+  if (top < margin) top = box.bottom + 8;
+  el.style.left = `${Math.round(left)}px`;
+  el.style.top = `${Math.round(Math.max(margin, top))}px`;
+}
+
+document.addEventListener("pointerover", (event) => {
+  if (event.pointerType === "touch") return;
+  const target = event.target.closest?.("[data-tip]");
+  if (!target || target.contains(event.relatedTarget)) return;
+  placeTooltip(target);
+});
+document.addEventListener("pointerout", (event) => {
+  const target = event.target.closest?.("[data-tip]");
+  if (!target || target.contains(event.relatedTarget)) return;
+  hideTooltip();
+});
+document.addEventListener("focusin", (event) => {
+  const target = event.target.closest?.("[data-tip]");
+  if (target) placeTooltip(target);
+});
+document.addEventListener("focusout", hideTooltip);
+window.addEventListener("scroll", hideTooltip, true);
+window.addEventListener("resize", hideTooltip);
 
 function showToast(message, error = false, actions = []) {
   const toast = $("#toast");
@@ -401,7 +469,7 @@ function syncAimConditionals() {
   const solid = $("#solidColorRow");
   if (solid) solid.classList.toggle("hidden", !cfg.imageSolid && !cfg.imageTint);
   const colorLabel = $("#modeColorLabel");
-  if (colorLabel) colorLabel.textContent = cfg.imageSolid ? "Silhouette color" : "Tint color";
+  if (colorLabel) colorLabel.textContent = cfg.imageSolid ? "Solid color" : "Tint color";
   const gif = $("#gifOptions");
   if (gif) gif.classList.toggle("hidden", !cfg.image || !animatedImage(cfg.image));
   const solidMode = $("#solidMode");
@@ -615,6 +683,19 @@ function renderAim() {
     el.classList.toggle("active", active);
     el.setAttribute("aria-pressed", String(active));
   });
+  const aimButtonRow = $("#aimButtonRow");
+  if (aimButtonRow) aimButtonRow.classList.toggle("hidden", visibility === "always");
+  const aimButtonValue = AIM_BUTTONS.includes(cfg.aimButton) ? cfg.aimButton : "right";
+  const aimButtonOption = document.querySelector(`#aimButtonMenu .custom-option[data-value="${aimButtonValue}"]`);
+  const aimButtonLabel = $("#aimButtonLabel");
+  if (aimButtonLabel) aimButtonLabel.textContent = aimButtonOption?.dataset.label || "Right Mouse";
+  $$("#aimButtonMenu .custom-option").forEach((option) => {
+    const active = option === aimButtonOption;
+    option.classList.toggle("active", active);
+    option.setAttribute("aria-selected", String(active));
+    const check = option.querySelector(".check");
+    if (check) check.textContent = active ? "✓" : "";
+  });
   if (!S.aimModeInitialized) {
     S.aimMode = cfg.image ? "image" : "shape";
     S.aimModeInitialized = true;
@@ -623,6 +704,7 @@ function renderAim() {
   $("#shapePanel")?.classList.toggle("hidden", S.aimMode !== "shape");
   $("#imagePanel")?.classList.toggle("hidden", S.aimMode !== "image");
   renderPresetToolbar("crosshair");
+  renderRecentImages();
   syncAimConditionals();
   const imageName = $("#imageName");
   if (imageName) {
@@ -630,8 +712,8 @@ function renderAim() {
       imageName.textContent = cfg.imageName || cfg.image.split(/[\\/]/).pop();
       imageName.nextElementSibling.textContent = "Click to replace";
     } else {
-      imageName.textContent = "Drop PNG / JPG / WebP / GIF / SVG / BMP / ICO or click to browse";
-      imageName.nextElementSibling.textContent = "Transparent images work best.";
+      imageName.textContent = "Drop an image or GIF, or click to browse";
+      imageName.nextElementSibling.textContent = "PNG, JPG, WebP, GIF, SVG, BMP, ICO";
     }
   }
   const remove = document.querySelector('[data-action="remove-image"]');
@@ -706,7 +788,7 @@ function renderDisplay() {
   const hardware = $("#hardwareInfo");
   if (hardware) {
     hardware.textContent = monitor
-      ? `${monitor.width}×${monitor.height} @ ${(monitor.scale * 100).toFixed(0)}% · ${monitor.hdr ? "HDR active" : monitor.advancedColor ? "Advanced Color active" : monitor.nightLight ? "Night Light active" : "SDR gamma ready"}`
+      ? `${monitor.width}×${monitor.height} @ ${(monitor.scale * 100).toFixed(0)}% · ${monitor.hdr ? "HDR on" : monitor.advancedColor ? "Color management on" : monitor.nightLight ? "Night Light on" : "SDR ready"}`
       : "No display detected.";
   }
   const status = $("#displayStatus");
@@ -718,7 +800,7 @@ function renderDisplay() {
   if (banner) {
     banner.classList.toggle("hidden", !S.warning);
     if (S.warning) {
-      $("#warningTitle").textContent = S.warning.code === "hdr" ? "HDR is active" : S.warning.code === "acm" ? "Advanced Color is active" : "Night Light is active";
+      $("#warningTitle").textContent = S.warning.code === "hdr" ? "HDR is on" : S.warning.code === "acm" ? "Windows color management is on" : "Night Light is on";
       $("#warningText").textContent = S.warning.message;
     }
   }
@@ -773,13 +855,13 @@ function syncFxModal() {
     if (mode === "repair") {
       message.textContent = repairFailed && S.fxRepairArmed && !fx.busy
         ? "FxSound could not be reinstalled. Check the log, then retry."
-        : "Crosshair+ closes FxSound, backs up its settings, uninstalls and reinstalls the current version, then restores your settings and starts it again. Sound is unavailable while this runs.";
+        : "Crosshair+ will reinstall FxSound and keep your settings. Sound is off while it runs.";
     } else {
       message.textContent = mode === "update"
         ? `FxSound ${fx.latestVersion || ""} is available.`
         : fx.installed
           ? `FxSound ${fx.version || ""} needs updating for live control.`
-          : "Install FxSound to enable live sound controls.";
+          : "Install FxSound to control sound here.";
     }
   }
   $("#fxProgress")?.classList.toggle("hidden", !fx.busy);
@@ -821,8 +903,8 @@ function renderAudio() {
   }
   const grid = $("#bandGrid");
   if (grid && !grid.querySelector(".fader")) {
-    grid.innerHTML = FADERS.map(([emoji, label], i) => `
-      <div class="fader" data-fader="${i}">
+    grid.innerHTML = FADERS.map(([emoji, label, tip], i) => `
+      <div class="fader" data-fader="${i}" data-tip="${esc(tip)}">
         <span class="fader-value" aria-hidden="true">0.0</span>
         <div class="fader-track"><input type="range" min="-12" max="12" step="0.5" data-band="${i}" aria-label="${label} (${FREQS[i]} Hz)"></div>
         <span class="fader-emoji" aria-hidden="true">${emoji}</span>
@@ -832,8 +914,16 @@ function renderAudio() {
   $$("[data-band]").forEach((el) => {
     const i = Number(el.dataset.band);
     if (document.activeElement !== el) el.value = audio.bands[i] ?? 0;
+    el.disabled = S.compareAudioActive;
     setRangeFill(el);
   });
+  const compareAudio = $("#compareAudio");
+  if (compareAudio) {
+    compareAudio.disabled = !audio.enabled;
+    compareAudio.classList.toggle("active", S.compareAudioActive);
+    compareAudio.setAttribute("aria-pressed", String(S.compareAudioActive));
+  }
+  $$("#view-audio input[type=range]").forEach((el) => { el.disabled = S.compareAudioActive; });
   const importStatus = $("#importStatus");
   const importName = $("#importName");
   if (importStatus && importName) {
@@ -865,10 +955,10 @@ function renderAudio() {
     const message = fx.busy
       ? (fx.task || "Working…")
       : needsSetup
-        ? "Set up FxSound to enable sound presets."
+        ? "Install FxSound to control sound here."
         : !fx.running
-          ? "FxSound is installed but not running. Launch it to enable live sound control."
-          : (fx.message && fx.message !== "FxSound is ready." ? fx.message : "FxSound is ready. Every slider applies live.");
+          ? "FxSound isn't running. Launch it for live sound."
+          : (fx.message && fx.message !== "FxSound is ready." ? fx.message : "FxSound is ready.");
     fxMessage.textContent = message;
     fxMessage.classList.toggle("error", /failed|could not|not installed|too old/i.test(message));
   }
@@ -999,12 +1089,7 @@ function renderSlotEditor() {
     if (event.shiftKey) parts.push("Shift");
     if (event.altKey) parts.push("Alt");
     if (event.metaKey) parts.push("Win");
-    let key = event.key;
-    if (key.length === 1) key = key.toUpperCase();
-    else if (key === " ") key = "Space";
-    else if (key.startsWith("Arrow")) key = key.slice(5);
-    else key = key.charAt(0).toUpperCase() + key.slice(1);
-    parts.push(key);
+    parts.push(hotkeyKeyName(event.key));
     slot.hotkey = parts.join("+");
     event.target.textContent = slot.hotkey;
     markSlotDirty();
@@ -1052,7 +1137,7 @@ function selectSlot(id, toggle = false) {
     S.slotSwitchTimer = setTimeout(() => {
       if (S.slotSwitchPending === id) {
         S.slotSwitchPending = null;
-        showToast("Slot switch timed out. Settings were not left half-applied.", true);
+        showToast("Slot switch timed out. Your settings were restored.", true);
       }
     }, 4000);
     window.__crosshairSlotSwitches = (window.__crosshairSlotSwitches || 0) + 1;
@@ -1079,7 +1164,46 @@ function closeCustomSelects() {
   $$(".custom-select").forEach((select) => {
     select.querySelector(".custom-menu")?.classList.add("hidden");
     select.querySelector(".custom-trigger")?.setAttribute("aria-expanded", "false");
+    select.querySelector(".recent-trigger")?.setAttribute("aria-expanded", "false");
   });
+}
+
+// Recent images live in the data folder, so a Remove can be undone from this
+// menu without a picker; it is shown whenever at least one file is stored.
+function renderRecentImages() {
+  const wrap = $("#recentImages");
+  const menu = $("#recentMenu");
+  if (!wrap || !menu) return;
+  // The open request owns the list until its disk scan lands.
+  if (S.recentLoading) return;
+  const images = S.crosshairImages || [];
+  wrap.classList.toggle("hidden", images.length === 0);
+  if (!images.length) {
+    if (S.customSelect === "recent") closeCustomSelects();
+    menu.replaceChildren();
+    return;
+  }
+  menu.innerHTML = images.map((image) => {
+    const name = esc(image.name);
+    const label = esc(image.label || image.name);
+    const src = `/crosshair-image/${encodeURIComponent(image.name)}`;
+    return `<div class="recent-row">
+      <button type="button" class="recent-pick" data-action="use-stored-image" data-name="${name}" title="${label}">
+        <img src="${src}" alt="" draggable="false"><span class="recent-name">${label}</span>
+      </button>
+      <button type="button" class="recent-delete" data-action="delete-stored-image" data-name="${name}" aria-label="Delete ${label}" title="Delete ${label}">✕</button>
+    </div>`;
+  }).join("");
+}
+
+function openRecentMenu() {
+  const wrap = $("#recentImages");
+  const menu = $("#recentMenu");
+  if (!wrap || !menu || !(S.crosshairImages || []).length) return;
+  S.customSelect = "recent";
+  $("#recentTrigger")?.setAttribute("aria-expanded", "true");
+  menu.classList.remove("hidden");
+  menu.querySelector("button")?.focus();
 }
 
 function renderEmojiPicker(slot) {
@@ -1095,9 +1219,22 @@ function applyPreset(module, id) {
   if (module === "crosshair") {
     const old = S.config.crosshair;
     const merged = clone(preset.config);
-    ["enabled", "image", "imageName", "imageScale", "imageRotation", "imageInvert", "imageSolid", "imageTint", "imageSolidColor", "gifSpeed", "gifPlaying", "monitor", "hideInMenus", "hideOnRmb", "aimVisibility"].forEach((key) => { merged[key] = old[key]; });
+    const keep = ["enabled", "monitor", "hideInMenus", "hideOnRmb", "aimVisibility", "aimButton"];
+    if (!preset.config.image) {
+      // A shape preset owns only the shape; image-mode presets restore the
+      // whole image block (path, scale, tint, GIF playback).
+      keep.push("image", "imageName", "imageScale", "imageRotation", "imageInvert", "imageSolid", "imageTint", "imageSolidColor", "gifSpeed", "gifPlaying");
+    }
+    keep.forEach((key) => { merged[key] = old[key]; });
     S.config.crosshair = merged;
     S.config.crosshair.activePreset = preset.id;
+    // The backend keeps the current image when this preset's file is gone; the
+    // tab follows whichever picture actually remains.
+    const presetImageName = (preset.config.image || "").split(/[\\/]/).pop();
+    const presetImageStored = !preset.config.image
+      || (S.crosshairImages || []).some((image) => image.name === presetImageName);
+    S.aimMode = (presetImageStored ? merged.image : old.image) ? "image" : "shape";
+    S.aimModeInitialized = true;
     send("UpdateCrosshair", { crosshair: S.config.crosshair });
     renderAim(); syncControls(); refreshPreview();
   } else if (module === "display") {
@@ -1139,21 +1276,35 @@ function updateScene() {
   const src = S.day ? "/assets/scene_day.png" : "/assets/scene_night.png";
   const scene = $("#sceneImage");
   if (scene && !scene.src.endsWith(src)) scene.src = src;
+  if (S.sceneSource === src) return;
+  S.sceneSource = src;
   const img = new Image();
-  img.onload = () => { S.sceneImage = img; drawLut(); };
+  img.onload = () => {
+    if (S.sceneSource !== src) return;
+    S.sceneImage = img;
+    S.lutKey = null;
+    drawLut();
+  };
   img.src = src;
 }
 
 function drawLut() {
   const canvas = $("#lutCanvas");
   if (!canvas || !S.sceneImage) return;
+  // FullState arrives after every command. Re-running a 518k-pixel LUT and a
+  // PNG encode for an unchanged scene and curve was the heaviest UI work.
+  const key = `${S.sceneSource || ""}|${S.lut ? [S.lut.r, S.lut.g, S.lut.b].map((plane) => (plane || []).join(",")).join("/") : "none"}`;
+  if (S.lutKey === key) return;
+  S.lutKey = key;
   const ctx = canvas.getContext("2d");
   const width = canvas.width;
   const height = canvas.height;
   ctx.clearRect(0, 0, width, height);
   ctx.drawImage(S.sceneImage, 0, 0, width, height);
-  mirrorLutCanvas(canvas);
-  if (!S.lut) return;
+  if (!S.lut) {
+    mirrorLutCanvas(canvas);
+    return;
+  }
   const data = ctx.getImageData(0, 0, width, height);
   const r = S.lut.r || [];
   const g = S.lut.g || [];
@@ -1164,6 +1315,7 @@ function drawLut() {
     data.data[i + 2] = b[data.data[i + 2]] ?? data.data[i + 2];
   }
   ctx.putImageData(data, 0, 0);
+  // Encode once, after the curve; the pre-LUT mirror was a discarded PNG.
   mirrorLutCanvas(canvas);
 }
 
@@ -1303,6 +1455,18 @@ function renderSettingsValues() {
   $("#setAutoRevert").checked = !!s.autoRevertSlots;
   $("#setOsdToast").checked = s.osdToast !== false;
   $("#versionLabel").textContent = `v${S.appVersion || "1.0.0"}`;
+  renderHotkeyConflicts();
+}
+
+function renderHotkeyConflicts() {
+  const box = $("#hotkeyConflicts");
+  if (!box) return;
+  const entries = Object.entries(S.hotkeyConflicts || {});
+  box.innerHTML = entries.length
+    ? `<div class="hotkey-conflict-title">Shortcuts another app owns</div>${entries
+        .map(([key, owner]) => `<div class="hotkey-conflict-row"><span>${esc(key)}</span><span>${esc(owner)}</span></div>`)
+        .join("")}`
+    : "";
 }
 function saveSettings() {
   if (!S.config) return;
@@ -1318,6 +1482,19 @@ function saveSettings() {
   S.config.settings = settings;
   send("SettingsChanged", { settings });
   closeSettings();
+}
+
+function setCompareAudioActive(active) {
+  const next = !!active;
+  if (S.compareAudioActive === next) return;
+  S.compareAudioActive = next;
+  const button = $("#compareAudio");
+  if (button) {
+    button.classList.toggle("active", next);
+    button.setAttribute("aria-pressed", String(next));
+  }
+  $$("#view-audio input[type=range]").forEach((el) => { el.disabled = next; });
+  send("CompareSound", { active: next });
 }
 
 function setCompareActive(active) {
@@ -1476,18 +1653,21 @@ document.addEventListener("click", (event) => {
     }
     case "open-preset": openPresetMenu(el.dataset.module); break;
     case "apply-preset": applyPreset(el.dataset.module, el.dataset.id); break;
-    case "save-preset":
-      S.savePresetModule = el.dataset.module;
-      $("#presetModalTitle").textContent = `Save ${el.dataset.module === "crosshair" ? "shape" : el.dataset.module} preset`;
+    case "save-preset": {
+      const module = el.dataset.module;
+      S.savePresetModule = module;
+      const kind = module === "crosshair" ? (S.aimMode === "image" ? "image" : "shape") : module;
+      $("#presetModalTitle").textContent = `Save ${kind} preset`;
       $("#presetName").value = "";
       $("#presetModal").classList.remove("hidden");
       $("#presetName").focus();
       break;
+    }
     case "close-preset-modal": $("#presetModal").classList.add("hidden"); break;
     case "submit-preset": {
       const name = $("#presetName").value.trim();
       if (!name) { showToast("Give the preset a name.", true); return; }
-      send("SavePreset", { module: S.savePresetModule, name });
+      send("SavePreset", { module: S.savePresetModule, name, imageMode: S.aimMode === "image" });
       $("#presetModal").classList.add("hidden");
       break;
     }
@@ -1497,7 +1677,7 @@ document.addEventListener("click", (event) => {
       if (!preset || preset.builtin) { showToast("Built-in presets cannot be deleted.", true); return; }
       confirmThen({
         title: `Delete “${preset.name}”?`,
-        message: "The preset is removed from the list. This cannot be undone.",
+        message: "The preset is removed. This cannot be undone.",
         confirm: "Delete preset",
         danger: true,
       }, () => send("DeletePreset", { module, id: preset.id }));
@@ -1506,12 +1686,6 @@ document.addEventListener("click", (event) => {
     case "aim-mode":
       S.aimMode = el.dataset.value;
       renderAim();
-      break;
-    case "style":
-      S.config.crosshair.style = el.dataset.value;
-      S.config.crosshair.activePreset = null;
-      send("UpdateCrosshair", { crosshair: S.config.crosshair });
-      renderAim(); syncControls(); refreshPreview();
       break;
     case "color":
       S.colorHsv = null;
@@ -1528,6 +1702,38 @@ document.addEventListener("click", (event) => {
       break;
     }
     case "import-image": send("ImportImage", { path: null }); break;
+    case "toggle-recent": {
+      const willOpen = S.customSelect !== "recent";
+      closeCustomSelects();
+      if (!willOpen) {
+        S.recentLoading = false;
+        break;
+      }
+      // Never paint the cached snapshot: scan the folder and open the menu once
+      // its rows are known, so an externally deleted file cannot appear.
+      S.customSelect = "recent";
+      S.recentLoading = true;
+      el.setAttribute("aria-expanded", "true");
+      const menu = $("#recentMenu");
+      menu?.classList.add("hidden");
+      menu?.replaceChildren();
+      send("RefreshRecentImages", {});
+      break;
+    }
+    case "use-stored-image": {
+      // The tab changes only when the backend confirms this pick, so the name
+      // must be remembered exactly as sent.
+      const name = el.dataset.name;
+      if (!name) break;
+      S.pendingStoredImage = name;
+      send("UseStoredImage", { name });
+      closeCustomSelects();
+      break;
+    }
+    case "delete-stored-image":
+      send("DeleteStoredImage", { name: el.dataset.name || "" });
+      closeCustomSelects();
+      break;
     case "remove-image":
       S.config.crosshair.image = null;
       S.config.crosshair.imageName = null;
@@ -1605,9 +1811,19 @@ document.addEventListener("click", (event) => {
       break;
     }
     case "custom-pick": {
-      if (!S.editing) return;
       const select = el.dataset.select;
       const value = el.dataset.value || "";
+      if (select === "aimButton") {
+        if (!AIM_BUTTONS.includes(value)) break;
+        closeCustomSelects();
+        S.config.crosshair.aimButton = value;
+        S.config.crosshair.activePreset = null;
+        send("UpdateCrosshair", { crosshair: S.config.crosshair });
+        renderAim(); refreshPreview();
+        $("#aimButton")?.focus();
+        break;
+      }
+      if (!S.editing) return;
       if (select.startsWith("module:")) {
         const key = select.slice(7);
         S.editing[key] = S.editing[key] || { on: false, preset: null };
@@ -1657,8 +1873,8 @@ document.addEventListener("click", (event) => {
     }
     case "flatten-eq":
       confirmThen({
-        title: "Apply imported curve to the ten sliders?",
-        message: "This is a 10-band approximation and removes the imported profile layer.",
+        title: "Apply imported curve?",
+        message: "This replaces the imported profile with a 10-band approximation.",
         confirm: "Apply to sliders",
       }, () => send("FlattenEqImport", {}));
       break;
@@ -1680,8 +1896,8 @@ document.addEventListener("click", (event) => {
     case "backup-restore":
       if (S.backupPreview) {
         confirmThen({
-          title: "Restore this backup?",
-          message: "Current custom presets, slots, imported crosshair images and the imported EQ profile will be replaced. General settings and current display/audio calibration stay as they are.",
+          title: "Replace your setup with this backup?",
+          message: "Presets, slots, images and the imported EQ will be replaced. General settings and current screen/sound adjustments stay.",
           confirm: "Restore backup",
           danger: true,
         }, () => send("RestoreBackup", {}));
@@ -1690,7 +1906,7 @@ document.addEventListener("click", (event) => {
     case "backup-undo":
       confirmThen({
         title: "Undo the last restore?",
-        message: "The presets, slots, images and EQ profile from before that restore come back, replacing what the restore brought in.",
+        message: "The previous presets, slots, images and EQ come back.",
         confirm: "Undo restore",
         danger: true,
       }, () => send("UndoRestore", {}));
@@ -1700,9 +1916,9 @@ document.addEventListener("click", (event) => {
     case "open-fxsound": send("OpenFxSound", {}); break;
     case "factory-reset":
       confirmThen({
-        title: "Reset everything to a clean install?",
-        message: "This wipes settings, slots, presets and imported images. The diagnostics log and the FxSound safety backup are kept.",
-        confirm: "Factory reset",
+        title: "Reset Crosshair+?",
+        message: "Removes settings, slots, presets and imported images. Logs and the FxSound backup stay.",
+        confirm: "Reset app",
         danger: true,
       }, () => send("FactoryReset", {}));
       break;
@@ -1827,7 +2043,7 @@ $("#colorHex")?.addEventListener("change", (event) => {
     applyCustomColor(rgbToHex(hex));
   } else {
     event.target.value = colorHexValue().toUpperCase();
-    showToast("Use a hex colour like #4EA8FF.", true);
+    showToast("Enter a color code like #4EA8FF.", true);
   }
 });
 document.addEventListener("pointerdown", (event) => {
@@ -1851,7 +2067,29 @@ compareButton?.addEventListener("pointerdown", (event) => {
 ["pointerup", "pointercancel", "lostpointercapture"].forEach((type) => {
   compareButton?.addEventListener(type, () => setCompareActive(false));
 });
-window.addEventListener("blur", () => setCompareActive(false));
+window.addEventListener("blur", () => {
+  setCompareActive(false);
+  setCompareAudioActive(false);
+});
+
+const compareAudioButton = $("#compareAudio");
+compareAudioButton?.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  try {
+    compareAudioButton.setPointerCapture?.(event.pointerId);
+  } catch (error) {
+    // Synthetic pointer events (the UI self-test) have no active pointer.
+  }
+  if (!S.config?.audio?.enabled) {
+    showToast("Turn Sound on to compare.", true);
+    return;
+  }
+  setCompareAudioActive(true);
+});
+["pointerup", "pointercancel", "lostpointercapture"].forEach((type) => {
+  compareAudioButton?.addEventListener(type, () => setCompareAudioActive(false));
+});
 $("#dropzone")?.addEventListener("keydown", (event) => {
   if (event.key === "Enter" || event.key === " ") { event.preventDefault(); send("ImportImage", { path: null }); }
 });
@@ -1872,10 +2110,119 @@ $("#slotEditor")?.addEventListener("focusout", (event) => {
     S.slotEditorFocused = false;
   }
 });
+function menuOptions(menu) {
+  if (!menu) return [];
+  return Array.from(menu.querySelectorAll("button:not(:disabled)")).filter((button) => !button.classList.contains("hidden"));
+}
+
+function focusMenuOption(menu, index) {
+  const options = menuOptions(menu);
+  if (!options.length) return;
+  options[(index + options.length) % options.length].focus();
+}
+
+// A modal makes the app behind it inert, and only the top-most open modal is
+// interactive. Focus is remembered on open and restored when it closes.
+const MODAL_IDS = ["settingsModal", "presetModal", "emojiModal", "importModal", "fxModal", "backupModal", "gamesModal", "confirmModal"];
+const modalOpeners = new WeakMap();
+// A dialog often focuses its first field before the observer runs, so the
+// element that opened it is the most recent focus target outside that dialog.
+const focusHistory = [];
+document.addEventListener("focusin", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLElement)) return;
+  const earlier = focusHistory.indexOf(target);
+  if (earlier >= 0) focusHistory.splice(earlier, 1);
+  focusHistory.push(target);
+  if (focusHistory.length > 12) focusHistory.shift();
+});
+const FOCUSABLE = "button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex='-1'])";
+
+function syncModalInert() {
+  const modals = MODAL_IDS.map((id) => $(`#${id}`)).filter(Boolean);
+  const open = modals.filter((modal) => !modal.classList.contains("hidden"));
+  const top = open[open.length - 1] || null;
+  ["header", "main", "footer"].forEach((selector) => {
+    const region = document.querySelector(selector);
+    if (region) region.inert = !!top;
+  });
+  modals.forEach((modal) => { modal.inert = !!top && modal !== top; });
+  if (top) {
+    if (!modalOpeners.has(top)) {
+      const active = document.activeElement;
+      let opener = active instanceof HTMLElement && !top.contains(active) ? active : null;
+      if (!opener) {
+        opener = focusHistory
+          .slice()
+          .reverse()
+          .find((element) => element.isConnected && !top.contains(element)) || null;
+      }
+      modalOpeners.set(top, opener);
+    }
+    // Programmatic opens (the self-test) may leave focus behind; move it in.
+    if (!top.contains(document.activeElement)) top.querySelector(FOCUSABLE)?.focus();
+  }
+  modals.forEach((modal) => {
+    if (!modal.classList.contains("hidden")) return;
+    const opener = modalOpeners.get(modal);
+    if (!opener) return;
+    modalOpeners.delete(modal);
+    if (opener.isConnected && !opener.closest("[inert]")) opener.focus();
+  });
+}
+const modalObserver = new MutationObserver(syncModalInert);
+MODAL_IDS.forEach((id) => {
+  const modal = $(`#${id}`);
+  if (modal) modalObserver.observe(modal, { attributes: true, attributeFilter: ["class"] });
+});
+syncModalInert();
+
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !$("#confirmModal")?.classList.contains("hidden")) {
     event.preventDefault();
     settleConfirm(false);
+    return;
+  }
+  const openMenu = event.target.closest?.(".preset-menu, .custom-menu, .recent-menu");
+  if (openMenu && !openMenu.classList.contains("hidden")) {
+    const options = menuOptions(openMenu);
+    const index = options.indexOf(document.activeElement);
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      const step = event.key === "ArrowDown" ? 1 : -1;
+      focusMenuOption(openMenu, index < 0 ? (step > 0 ? 0 : options.length - 1) : index + step);
+      return;
+    }
+    if (event.key === "Enter" && index >= 0) {
+      event.preventDefault();
+      options[index].click();
+      return;
+    }
+  }
+  const trigger = event.target.closest?.(".preset-trigger, .custom-trigger, .recent-trigger");
+  if (trigger && !trigger.disabled && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+    event.preventDefault();
+    const module = trigger.dataset.module;
+    if (trigger.classList.contains("preset-trigger") && module) {
+      openPresetMenu(module);
+    } else if (trigger.id === "recentTrigger") {
+      closeCustomSelects();
+      S.customSelect = "recent";
+      trigger.setAttribute("aria-expanded", "true");
+      $("#recentMenu")?.classList.remove("hidden");
+      renderRecentImages();
+    } else {
+      const key = trigger.dataset.select;
+      closeCustomSelects();
+      if (key) {
+        S.customSelect = key;
+        trigger.setAttribute("aria-expanded", "true");
+        trigger.closest(".custom-select")?.querySelector(".custom-menu")?.classList.remove("hidden");
+      }
+    }
+    const menu = trigger.closest(".custom-select")?.querySelector(".custom-menu") || trigger.parentElement?.querySelector(".preset-menu");
+    const options = menuOptions(menu);
+    (event.key === "ArrowDown" ? options[0] : options[options.length - 1])?.focus();
     return;
   }
   const field = event.target.closest?.("[data-module-hotkey]");
@@ -1895,12 +2242,7 @@ document.addEventListener("keydown", (event) => {
     if (event.shiftKey) parts.push("Shift");
     if (event.altKey) parts.push("Alt");
     if (event.metaKey) parts.push("Win");
-    let key = event.key;
-    if (key.length === 1) key = key.toUpperCase();
-    else if (key === " ") key = "Space";
-    else if (key.startsWith("Arrow")) key = key.slice(5);
-    else key = key.charAt(0).toUpperCase() + key.slice(1);
-    parts.push(key);
+    parts.push(hotkeyKeyName(event.key));
     const value = parts.join("+");
     field.textContent = value;
     send("AssignModuleHotkey", { module, hotkey: value });
@@ -1914,7 +2256,15 @@ document.addEventListener("keydown", (event) => {
     else if (!$("#fxModal").classList.contains("hidden")) closeFxModal();
     else if (!$("#gamesModal").classList.contains("hidden")) $("#gamesModal").classList.add("hidden");
     else if (!$("#colorPopover")?.classList.contains("hidden")) openColorPopover(false);
-    else if (S.customSelect || S.presetMenu) { closeCustomSelects(); closePresetMenus(); }
+    else if (S.customSelect || S.presetMenu) {
+      const selectKey = S.customSelect;
+      const presetModule = S.presetMenu;
+      closeCustomSelects();
+      closePresetMenus();
+      if (selectKey === "recent") $("#recentTrigger")?.focus();
+      else if (selectKey) document.querySelector(`.custom-trigger[data-select="${selectKey}"]`)?.focus();
+      else if (presetModule) $(`#${presetModule === "crosshair" ? "aim" : presetModule}PresetTrigger`)?.focus();
+    }
     else if (!$("#settingsModal").classList.contains("hidden")) closeSettings();
   }
 });
@@ -1935,6 +2285,7 @@ function handleMessage(message) {
     // now reports every scan outcome; a FullState must not mask it.
     if (!$("#gamesModal")?.classList.contains("hidden")) renderGamesPicker();
     S.crosshairPresets = payload.crosshairPresets || [];
+    S.crosshairImages = payload.crosshairImages || [];
     S.displayPresets = payload.displayPresets || [];
     S.audioPresets = payload.audioPresets || [];
     S.selectedSlot = payload.selectedSlot;
@@ -2010,7 +2361,26 @@ function handleMessage(message) {
     if (!$("#gamesModal")?.classList.contains("hidden")) renderGamesPicker();
     else if (S.tab === "slots") renderSlotEditor();
   } else if (type === "HotkeyConflict") {
+    S.hotkeyConflicts[payload.key] = payload.owner || "another app";
+    renderHotkeyConflicts();
     showToast(`Hotkey ${payload.key} is already used by ${payload.owner || "another app"}.`, true);
+  } else if (type === "HotkeyResolved") {
+    delete S.hotkeyConflicts[payload.key];
+    renderHotkeyConflicts();
+  } else if (type === "StoredImageResult") {
+    if (S.pendingStoredImage && payload.name === S.pendingStoredImage) {
+      S.pendingStoredImage = null;
+      if (payload.ok) {
+        S.aimMode = "image";
+        S.aimModeInitialized = true;
+        renderAim();
+      }
+    }
+  } else if (type === "RecentImages") {
+    S.recentLoading = false;
+    S.crosshairImages = payload.images || [];
+    renderRecentImages();
+    if (S.customSelect === "recent") openRecentMenu();
   } else if (type === "DiagnosticBanner") {
     if (payload.code === "slot") {
       S.slotSavePending = false;

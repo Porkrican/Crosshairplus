@@ -19,13 +19,14 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW, MonitorFromWindow,
-    ReleaseDC, SelectObject, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    ReleaseDC, SelectObject, HBITMAP, HDC, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_RBUTTON,
+    GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT, VK_LBUTTON, VK_MBUTTON,
+    VK_RBUTTON, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorInfo,
@@ -84,6 +85,7 @@ pub struct OverlayRuntimeState {
 pub enum OverlayEvent {
     Hotkey { id: i32 },
     HotkeyConflict { slot_id: Option<String>, key: String, owner: String },
+    HotkeyResolved { slot_id: Option<String>, key: String },
     DisplayChanged,
     ForegroundChanged,
     PowerSuspend,
@@ -144,6 +146,13 @@ struct Ctx {
     target_size: (u32, u32),
     registered: Vec<i32>,
     hotkey_sig: Vec<(i32, u32, u32, String, Option<String>)>,
+    /// Bindings another application owned at registration time. They are
+    /// retried on a timer and on every foreground change instead of being lost.
+    failed_hotkeys: Vec<HotkeyBinding>,
+    hotkey_retry_at: Option<Instant>,
+    /// Cheap draw signature; an unchanged crosshair skips D3D entirely.
+    last_sig: Option<u64>,
+    surface: Option<LayeredSurface>,
     win_event: Option<HWINEVENTHOOK>,
     visible: bool,
     timer_running: bool,
@@ -160,6 +169,27 @@ struct Ctx {
 struct Toast {
     text: String,
     started: Instant,
+}
+
+/// The DIB, memory DC and screen DC are reused across paints; recreating them
+/// for every 30 ms tick was pure churn.
+struct LayeredSurface {
+    screen: HDC,
+    mem: HDC,
+    dib: HBITMAP,
+    bits: *mut c_void,
+    width: u32,
+    height: u32,
+}
+
+impl Drop for LayeredSurface {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteObject(self.dib.into());
+            let _ = DeleteDC(self.mem);
+            ReleaseDC(None, self.screen);
+        }
+    }
 }
 
 thread_local! {
@@ -231,7 +261,14 @@ impl OverlayHandle {
         self.post();
     }
 
-    #[cfg(test)]
+    /// The input most recently handed to the overlay thread. The verify
+    /// harness uses this to assert the actual image payload, not just a count.
+    pub fn applied(&self) -> Option<Input> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Read-only runtime counters. The verify harness uses these to prove an
+    /// image command actually reached the overlay handle.
     pub fn state(&self) -> OverlayRuntimeState {
         self.runtime.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -342,6 +379,10 @@ fn run(
                 target_size: (0, 0),
                 registered: Vec::new(),
                 hotkey_sig: Vec::new(),
+                failed_hotkeys: Vec::new(),
+                hotkey_retry_at: None,
+                last_sig: None,
+                surface: None,
                 win_event: None,
                 visible: false,
                 timer_running: false,
@@ -504,7 +545,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_QUERYENDSESSION => LRESULT(1),
             WM_ENDSESSION => {
                 if end_session_requested(wparam.0) {
-                    crate::safety::restore_all_blocking();
+                    // Gamma ramps restore in milliseconds; the FxSound CLI is
+                    // capped so Windows is never held hostage by it.
+                    crate::safety::restore_for_shutdown();
                     CTX.with(|slot| {
                         if let Some(ctx) = slot.borrow().as_ref() {
                             let _ = ctx.proxy.send_event(AppEvent::Overlay(OverlayEvent::EndSession));
@@ -542,6 +585,7 @@ fn refresh() {
             register_all(ctx, &input.hotkeys);
             ctx.hotkey_sig = sig;
         }
+        retry_failed_hotkeys(ctx);
         if !input.config.enabled {
             if ctx.visible {
                 crate::logging::log("overlay: hidden because Aim is off");
@@ -581,6 +625,7 @@ fn tick() {
         }
         let input = ctx.shared.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(input) = input else { return };
+        retry_failed_hotkeys(ctx);
         if !input.config.enabled {
             hide(ctx);
             stop_timer(ctx);
@@ -588,6 +633,18 @@ fn tick() {
         }
         if hidden_by_policy(&input.config) {
             hide(ctx);
+            return;
+        }
+        let aim = aim_down(&input.config);
+        // Repaint only when the visible pixels can differ. The animation frame
+        // is part of the signature, so a 10 fps source is not repainted on
+        // every 30 ms poll but still advances on its own cadence.
+        let phase = ctx
+            .renderer
+            .as_ref()
+            .map(|renderer| renderer.preview_frame(&input.config, crate::render::now_ms()))
+            .unwrap_or(0);
+        if ctx.last_sig == Some(draw_signature(&input, aim, phase)) && ctx.visible {
             return;
         }
         if let Err(err) = render(ctx, &input) {
@@ -603,25 +660,52 @@ fn register_all(ctx: &mut Ctx, bindings: &[HotkeyBinding]) {
             let _ = UnregisterHotKey(Some(ctx.hub), id);
         }
     }
+    ctx.failed_hotkeys.clear();
     for binding in bindings {
-        let result = unsafe {
-            RegisterHotKey(Some(ctx.hub), binding.id, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(binding.mods | MOD_NOREPEAT.0), binding.vk)
-        };
-        match result {
-            Ok(()) => {
-                crate::logging::log(&format!("overlay: registered hotkey {}", binding.key));
-                ctx.registered.push(binding.id)
-            }
-            Err(err) => {
-                crate::logging::log(&format!("overlay: hotkey {} was rejected: {err}", binding.key));
-                let _ = ctx.proxy.send_event(AppEvent::Overlay(OverlayEvent::HotkeyConflict {
-                    slot_id: binding.slot_id.clone(),
-                    key: binding.key.clone(),
-                    owner: "another application".into(),
-                }));
-            }
+        register_one(ctx, binding.clone());
+    }
+    ctx.hotkey_retry_at = (!ctx.failed_hotkeys.is_empty()).then(|| Instant::now() + Duration::from_secs(5));
+}
+
+fn register_one(ctx: &mut Ctx, binding: HotkeyBinding) {
+    let result = unsafe {
+        RegisterHotKey(Some(ctx.hub), binding.id, windows::Win32::UI::Input::KeyboardAndMouse::HOT_KEY_MODIFIERS(binding.mods | MOD_NOREPEAT.0), binding.vk)
+    };
+    match result {
+        Ok(()) => {
+            crate::logging::log(&format!("overlay: registered hotkey {}", binding.key));
+            ctx.registered.push(binding.id);
+            let _ = ctx.proxy.send_event(AppEvent::Overlay(OverlayEvent::HotkeyResolved {
+                slot_id: binding.slot_id,
+                key: binding.key,
+            }));
+        }
+        Err(err) => {
+            crate::logging::log(&format!("overlay: hotkey {} was rejected: {err}", binding.key));
+            let _ = ctx.proxy.send_event(AppEvent::Overlay(OverlayEvent::HotkeyConflict {
+                slot_id: binding.slot_id.clone(),
+                key: binding.key.clone(),
+                owner: "another application".into(),
+            }));
+            ctx.failed_hotkeys.push(binding);
         }
     }
+}
+
+/// Retry conflicts every five seconds. A game that holds a key only while it
+/// starts is the common case, and the user should not have to restart the app.
+fn retry_failed_hotkeys(ctx: &mut Ctx) {
+    if ctx.failed_hotkeys.is_empty() {
+        return;
+    }
+    if ctx.hotkey_retry_at.is_some_and(|at| Instant::now() < at) {
+        return;
+    }
+    let pending = std::mem::take(&mut ctx.failed_hotkeys);
+    for binding in pending {
+        register_one(ctx, binding);
+    }
+    ctx.hotkey_retry_at = (!ctx.failed_hotkeys.is_empty()).then(|| Instant::now() + Duration::from_secs(5));
 }
 
 fn ensure_overlay(ctx: &mut Ctx) -> bool {
@@ -841,7 +925,7 @@ fn paint_osd(ctx: &mut Ctx) -> windows::core::Result<()> {
     }
     let x = monitor_x + (monitor_w as i32 - width_u as i32) / 2;
     let y = monitor_y + (48.0 * scale) as i32;
-    update_layered(hwnd, x, y, width_u, height_u, &premultiplied)?;
+    update_layered(ctx, hwnd, x, y, width_u, height_u, &premultiplied)?;
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
@@ -890,13 +974,15 @@ fn render(ctx: &mut Ctx, input: &Input) -> windows::core::Result<()> {
     let target = ctx.target.as_ref().unwrap();
     renderer.engine.begin(target, Rgba::rgb(0x000000).alpha(0.0));
     let center = windows_numerics::Vector2 { X: width as f32 * 0.5, Y: height as f32 * 0.5 };
-    let draw = renderer.draw(&renderer.engine.ctx, &input.config, center, crate::render::now_ms());
+    let now = crate::render::now_ms();
+    let phase = renderer.preview_frame(&input.config, now);
+    let draw = renderer.draw(&renderer.engine.ctx, &input.config, center, now);
     let end = renderer.engine.end();
     draw?;
     end?;
-    let (_, premul) = renderer.engine.readback(target)?;
+    let premul = renderer.engine.readback_premultiplied(target)?;
     let overlay = ctx.overlay.unwrap();
-    if let Err(err) = update_layered(overlay, left, top, width_u, height_u, &premul) {
+    if let Err(err) = update_layered(ctx, overlay, left, top, width_u, height_u, &premul) {
         crate::logging::log(&format!("overlay: UpdateLayeredWindow failed: {err}"));
         return Err(err);
     }
@@ -907,6 +993,7 @@ fn render(ctx: &mut Ctx, input: &Input) -> windows::core::Result<()> {
         crate::logging::log(&format!("overlay: shown at {left},{top} {width}x{height} on {}", input.monitor_label));
     }
     ctx.visible = true;
+    ctx.last_sig = Some(draw_signature(input, aim_down(&input.config), phase));
     mark_rendered(&ctx.runtime);
     ctx.cost.record(paint_started.elapsed(), thread_cpu_100ns());
     Ok(())
@@ -927,16 +1014,20 @@ fn thread_cpu_100ns() -> u64 {
     crate::app::filetime_100ns(kernel) + crate::app::filetime_100ns(user)
 }
 
-fn update_layered(hwnd: HWND, x: i32, y: i32, width: u32, height: u32, premultiplied: &[u8]) -> windows::core::Result<()> {
+fn ensure_surface(ctx: &mut Ctx, width: u32, height: u32) -> bool {
+    if ctx.surface.as_ref().is_some_and(|surface| surface.width == width && surface.height == height) {
+        return true;
+    }
+    ctx.surface = None;
     unsafe {
         let screen = GetDC(None);
         if screen.0.is_null() {
-            return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+            return false;
         }
         let mem = CreateCompatibleDC(Some(screen));
         if mem.0.is_null() {
             ReleaseDC(None, screen);
-            return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+            return false;
         }
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -951,30 +1042,47 @@ fn update_layered(hwnd: HWND, x: i32, y: i32, width: u32, height: u32, premultip
             ..Default::default()
         };
         let mut bits: *mut c_void = std::ptr::null_mut();
-        let dib = match CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
-            Ok(dib) => dib,
-            Err(err) => {
+        match CreateDIBSection(Some(mem), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(dib) if !dib.0.is_null() && !bits.is_null() => {
+                ctx.surface = Some(LayeredSurface { screen, mem, dib, bits, width, height });
+                true
+            }
+            Ok(dib) => {
+                if !dib.0.is_null() {
+                    let _ = DeleteObject(dib.into());
+                }
                 let _ = DeleteDC(mem);
                 ReleaseDC(None, screen);
-                return Err(err);
+                false
             }
-        };
-        if dib.0.is_null() || bits.is_null() {
-            if !dib.0.is_null() {
-                let _ = DeleteObject(dib.into());
+            Err(_) => {
+                let _ = DeleteDC(mem);
+                ReleaseDC(None, screen);
+                false
             }
-            let _ = DeleteDC(mem);
-            ReleaseDC(None, screen);
-            return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
         }
-        let copy_len = (width * height * 4) as usize;
-        if premultiplied.len() < copy_len {
-            let _ = DeleteObject(dib.into());
-            let _ = DeleteDC(mem);
-            ReleaseDC(None, screen);
-            return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
-        }
-        let old = SelectObject(mem, dib.into());
+    }
+}
+
+fn update_layered(
+    ctx: &mut Ctx,
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    premultiplied: &[u8],
+) -> windows::core::Result<()> {
+    if !ensure_surface(ctx, width, height) {
+        return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+    }
+    let copy_len = (width * height * 4) as usize;
+    if premultiplied.len() < copy_len {
+        return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+    }
+    unsafe {
+        let surface = ctx.surface.as_ref().expect("surface was just ensured");
+        let old = SelectObject(surface.mem, surface.dib.into());
         let dst = POINT { x, y };
         let size = SIZE { cx: width as i32, cy: height as i32 };
         let src = POINT { x: 0, y: 0 };
@@ -984,22 +1092,19 @@ fn update_layered(hwnd: HWND, x: i32, y: i32, width: u32, height: u32, premultip
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        std::ptr::copy_nonoverlapping(premultiplied.as_ptr(), bits as *mut u8, copy_len);
+        std::ptr::copy_nonoverlapping(premultiplied.as_ptr(), surface.bits as *mut u8, copy_len);
         let result = UpdateLayeredWindow(
             hwnd,
-            Some(screen),
+            Some(surface.screen),
             Some(&dst),
             Some(&size),
-            Some(mem),
+            Some(surface.mem),
             Some(&src),
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
         );
-        SelectObject(mem, old);
-        let _ = DeleteObject(dib.into());
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
+        SelectObject(surface.mem, old);
         result
     }
 }
@@ -1011,6 +1116,7 @@ fn hide(ctx: &mut Ctx) {
         }
     }
     ctx.visible = false;
+    ctx.last_sig = None;
     let mut state = ctx.runtime.lock().unwrap_or_else(|e| e.into_inner());
     state.visible = false;
     state.hidden = true;
@@ -1045,17 +1151,32 @@ fn stop_timer(ctx: &mut Ctx) {
 }
 
 /// The visibility rule is pure so all three modes and the menu precedence can
-/// be tested without a window station. Menus always win: `Only on Aim` must not
+/// be tested without a window station. Menus always win: `Only` must not
 /// paint the crosshair over Start, a taskbar menu or an app menu.
-pub(crate) fn aim_hidden(visibility: &str, hide_in_menus: bool, rmb_down: bool, menu_open: bool) -> bool {
+pub(crate) fn aim_hidden(visibility: &str, hide_in_menus: bool, aiming: bool, menu_open: bool) -> bool {
     if hide_in_menus && menu_open {
         return true;
     }
     match visibility {
-        "hide" => rmb_down,
-        "only" => !rmb_down,
+        "hide" => aiming,
+        "only" => !aiming,
         _ => false,
     }
+}
+
+fn aim_button_vk(button: Option<&str>) -> u32 {
+    match button.unwrap_or("right") {
+        "left" => VK_LBUTTON.0 as u32,
+        "middle" => VK_MBUTTON.0 as u32,
+        "mouse4" => VK_XBUTTON1.0 as u32,
+        "mouse5" => VK_XBUTTON2.0 as u32,
+        _ => VK_RBUTTON.0 as u32,
+    }
+}
+
+fn aim_down(config: &CrosshairConfig) -> bool {
+    let state = unsafe { GetAsyncKeyState(aim_button_vk(config.aim_button.as_deref()) as i32) };
+    (state as u16 & 0x8000) != 0
 }
 
 fn hidden_by_policy(config: &CrosshairConfig) -> bool {
@@ -1064,12 +1185,47 @@ fn hidden_by_policy(config: &CrosshairConfig) -> bool {
         .as_deref()
         .filter(|value| matches!(*value, "always" | "hide" | "only"))
         .unwrap_or(if config.hide_on_rmb { "hide" } else { "always" });
-    let rmb_down = unsafe {
-        let state = GetAsyncKeyState(VK_RBUTTON.0 as i32);
-        (state as u16 & 0x8000) != 0
-    };
     let menu = config.hide_in_menus && menu_open();
-    aim_hidden(visibility, config.hide_in_menus, rmb_down, menu)
+    aim_hidden(visibility, config.hide_in_menus, aim_down(config), menu)
+}
+
+/// Everything that changes the rendered pixels. `refresh` always paints once,
+/// so this only needs to separate identical 30 ms polls from real changes.
+fn draw_signature(input: &Input, aim: bool, phase: usize) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    let c = &input.config;
+    c.enabled.hash(&mut h);
+    c.style.hash(&mut h);
+    for value in [
+        c.size,
+        c.thickness,
+        c.gap,
+        c.rotation,
+        c.dot_size,
+        c.outline_width,
+        c.opacity,
+        c.image_scale,
+        c.image_rotation,
+        c.gif_speed,
+    ] {
+        value.to_bits().hash(&mut h);
+    }
+    c.dot.hash(&mut h);
+    c.outline.hash(&mut h);
+    c.image_invert.hash(&mut h);
+    c.image_solid.hash(&mut h);
+    c.image_tint.hash(&mut h);
+    c.color.hash(&mut h);
+    c.image.hash(&mut h);
+    c.image_solid_color.hash(&mut h);
+    c.offset_x.hash(&mut h);
+    c.offset_y.hash(&mut h);
+    input.rect.hash(&mut h);
+    aim.hash(&mut h);
+    phase.hash(&mut h);
+    h.finish()
 }
 
 fn menu_open() -> bool {
@@ -1149,6 +1305,16 @@ mod tests {
         assert!(aim_hidden("only", true, true, true), "a menu hides even while aiming");
         assert!(aim_hidden("hide", true, false, true));
         assert!(!aim_hidden("hide", false, false, true), "menus only apply when enabled");
+    }
+
+    #[test]
+    fn aim_button_tokens_map_to_the_expected_virtual_keys() {
+        assert_eq!(aim_button_vk(None), VK_RBUTTON.0 as u32);
+        assert_eq!(aim_button_vk(Some("left")), VK_LBUTTON.0 as u32);
+        assert_eq!(aim_button_vk(Some("middle")), VK_MBUTTON.0 as u32);
+        assert_eq!(aim_button_vk(Some("mouse4")), VK_XBUTTON1.0 as u32);
+        assert_eq!(aim_button_vk(Some("mouse5")), VK_XBUTTON2.0 as u32);
+        assert_eq!(aim_button_vk(Some("unknown")), VK_RBUTTON.0 as u32);
     }
 
     #[test]

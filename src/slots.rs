@@ -28,6 +28,10 @@ use crate::config::{Config, Slot, SlotSnapshot, MAX_SLOTS, MAX_SLOT_NAME};
 #[serde(rename_all = "camelCase")]
 pub struct RunningApp {
     pub exe: String,
+    /// Full image path when `OpenProcess` permitted it. Anti-cheat protected
+    /// games only expose the basename, so this stays optional.
+    #[serde(default)]
+    pub path: Option<String>,
     pub title: String,
     pub pid: u32,
     /// Cached 32px PNG data URL, or None when extraction failed.
@@ -188,17 +192,22 @@ pub fn save_slot(config: &mut Config, mut slot: Slot) -> Result<(), String> {
 
 /// Save the currently edited slot (when provided) and then switch activation in
 /// one operation. The save is validated before any active state is touched, so
-/// a rejected edit cannot leave the app half-switched.
-pub fn switch_slot(config: &mut Config, id: Option<&str>, save: Option<Slot>) -> Result<bool, String> {
+/// a rejected edit cannot leave the app half-switched. Also returns the label
+/// of a preset image that had to be skipped because its file is gone.
+pub fn switch_slot(
+    config: &mut Config,
+    id: Option<&str>,
+    save: Option<Slot>,
+) -> Result<(bool, Option<String>), String> {
     if let Some(slot) = save {
         save_slot(config, slot)?;
     }
     match id {
         Some(id) => {
-            activate_slot(config, id)?;
-            Ok(true)
+            let missing_image = activate_slot(config, id)?;
+            Ok((true, missing_image))
         }
-        None => Ok(deactivate_slot(config)),
+        None => Ok((deactivate_slot(config), None)),
     }
 }
 
@@ -214,10 +223,10 @@ pub fn restore_session_baseline(config: &mut Config) -> bool {
     true
 }
 
-pub fn activate_slot(config: &mut Config, id: &str) -> Result<(), String> {
+pub fn activate_slot(config: &mut Config, id: &str) -> Result<Option<String>, String> {
     let slot = config.slots.list.iter().find(|s| s.id == id).cloned().ok_or("Slot not found.")?;
     if config.slots.active.as_deref() == Some(id) {
-        return Ok(());
+        return Ok(None);
     }
     if config.slots.baseline.is_none() {
         config.slots.baseline = Some(SlotSnapshot {
@@ -229,9 +238,10 @@ pub fn activate_slot(config: &mut Config, id: &str) -> Result<(), String> {
             audio_was_on: config.audio.enabled,
         });
     }
+    let mut missing_image = None;
     if slot.crosshair.on {
         if let Some(preset) = slot.crosshair.preset.as_deref().and_then(|p| config.find_crosshair_preset(p)) {
-            preset.apply_to(&mut config.crosshair);
+            missing_image = preset.apply_to_checked(&mut config.crosshair);
             config.crosshair.active_preset = Some(preset.id);
         }
         config.crosshair.enabled = true;
@@ -269,52 +279,96 @@ pub fn activate_slot(config: &mut Config, id: &str) -> Result<(), String> {
         config.audio.normalize();
     }
     config.slots.active = Some(id.to_string());
-    Ok(())
+    Ok(missing_image)
 }
 
 /// Returns true when the active slot was actually reverted.
 pub fn deactivate_slot(config: &mut Config) -> bool {
     let Some(active) = config.slots.active.clone() else { return false };
-    let Some(slot) = config.slots.list.iter().find(|s| s.id == active).cloned() else {
+    if !config.slots.list.iter().any(|s| s.id == active) {
         config.slots.active = None;
         config.slots.baseline = None;
         return false;
-    };
+    }
     let Some(baseline) = config.slots.baseline.clone() else {
         config.slots.active = None;
         return false;
     };
+    // Restore every module, not only the ones the active slot enabled. A later
+    // slot can change a different module (A -> B -> Off), and the session
+    // baseline is the only record of the state before any slot ran.
     // Crash recovery applies a snapshot straight from a hand-editable config, so
     // the restored values are held to the same ranges as any other input.
-    if slot.crosshair.on {
-        config.crosshair = baseline.crosshair;
-        config.crosshair.normalize();
+    config.crosshair = baseline.crosshair;
+    config.crosshair.enabled = baseline.crosshair_was_on;
+    config.crosshair.normalize();
+    // The snapshot may have captured an image that was deleted outside the app
+    // while the slot was active; never bring that path back.
+    if let Some(name) = crate::config::clear_missing_live_image(&mut config.crosshair) {
+        crate::logging::log(&format!("slots: dropped the restored image whose file is gone ({name})"));
     }
-    if slot.display.on {
-        config.display = baseline.display;
-        config.display.normalize();
-    }
-    if slot.audio.on {
-        config.audio = baseline.audio;
-    }
+    config.display = baseline.display;
+    config.display.enabled = baseline.display_was_on;
+    config.display.normalize();
+    config.audio = baseline.audio;
+    config.audio.enabled = baseline.audio_was_on;
+    config.audio.normalize();
     config.slots.active = None;
     config.slots.baseline = None;
     true
+}
+
+fn normalize_path(value: &str) -> String {
+    value.trim().trim_matches('"').replace('/', "\\").to_ascii_lowercase()
+}
+
+fn has_path(target: &str) -> bool {
+    target.contains('\\') || target.contains('/')
+}
+
+/// The snapshot gives only a basename. That is enough as a last resort, but it
+/// cannot tell two `game.exe` folders apart.
+fn basename_eq(target: &str, running_exe: &str) -> bool {
+    let target = normalize_path(target);
+    let running = normalize_path(running_exe);
+    let name = Path::new(&target).file_name().and_then(|n| n.to_str()).unwrap_or(&target);
+    let running_name = Path::new(&running).file_name().and_then(|n| n.to_str()).unwrap_or(&running);
+    name.eq_ignore_ascii_case(running_name)
 }
 
 pub fn exe_matches(target: &str, running_exe: &str) -> bool {
     if target.eq_ignore_ascii_case(running_exe) {
         return true;
     }
-    Path::new(target)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.eq_ignore_ascii_case(running_exe))
-        .unwrap_or(false)
+    let target_path = normalize_path(target);
+    let running_path = normalize_path(running_exe);
+    if has_path(target) {
+        // A full path only matches a full path: a bare basename from the
+        // process snapshot cannot prove it lives in the requested folder.
+        return target_path == running_path;
+    }
+    basename_eq(&target_path, &running_path)
 }
 
+#[cfg(test)]
 pub fn slot_for_exe<'a>(config: &'a Config, exe: &str) -> Option<&'a Slot> {
-    config.slots.list.iter().find(|s| s.target_exe.as_deref().map(|t| exe_matches(t, exe)).unwrap_or(false))
+    config.slots.list.iter().find(|s| s.target_exe.as_deref().map(|t| basename_eq(t, exe)).unwrap_or(false))
+}
+
+fn target_matches_app(target: &str, app: &RunningApp) -> bool {
+    if has_path(target) {
+        if let Some(path) = app.path.as_deref() {
+            return normalize_path(target) == normalize_path(path);
+        }
+        // Access denied (typical for anti-cheat protected games): the full
+        // target can only be resolved by its basename.
+        return basename_eq(target, &app.exe);
+    }
+    exe_matches(target, &app.exe)
+}
+
+pub fn slot_for_running_app<'a>(config: &'a Config, app: &RunningApp) -> Option<&'a Slot> {
+    config.slots.list.iter().find(|s| s.target_exe.as_deref().map(|t| target_matches_app(t, app)).unwrap_or(false))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -342,12 +396,24 @@ pub fn cycle_target(config: &Config) -> Option<CycleTarget> {
 }
 
 /// The foreground watcher only activates a target slot when no slot is active.
+#[cfg(test)]
 pub fn auto_activate_for(config: &Config, foreground_exe: Option<&str>) -> Option<String> {
     if config.slots.active.is_some() {
         return None;
     }
     let exe = foreground_exe?;
     slot_for_exe(config, exe)
+        .filter(|slot| slot.target_exe.is_some())
+        .map(|slot| slot.id.clone())
+}
+
+/// Path-aware variant used by the foreground watcher. `auto_activate_for`
+/// stays for callers that only have a basename (and for the tests).
+pub fn auto_activate_for_app(config: &Config, app: &RunningApp) -> Option<String> {
+    if config.slots.active.is_some() {
+        return None;
+    }
+    slot_for_running_app(config, app)
         .filter(|slot| slot.target_exe.is_some())
         .map(|slot| slot.id.clone())
 }
@@ -359,6 +425,35 @@ pub fn active_target_stopped(config: &Config) -> bool {
         return false;
     };
     !process_running(target)
+}
+
+const ABSENT_TICKS_REQUIRED: u8 = 2;
+
+/// Consecutive watcher ticks for which the active slot's target has been gone.
+/// Two ticks (~2s) keep a splash-screen relaunch from flickering the slot off
+/// and back on.
+#[derive(Default)]
+pub struct SlotAbsence {
+    slot: Option<String>,
+    ticks: u8,
+}
+
+impl SlotAbsence {
+    /// Records one stopped tick for `active`. Returns true only after the same
+    /// slot has been absent for two consecutive ticks.
+    pub fn observe(&mut self, active: Option<&str>) -> bool {
+        if self.slot.as_deref() != active {
+            self.slot = active.map(|id| id.to_string());
+            self.ticks = 0;
+        }
+        self.ticks = self.ticks.saturating_add(1);
+        self.ticks >= ABSENT_TICKS_REQUIRED
+    }
+
+    /// Clears the count when the target is seen running or auto-revert is off.
+    pub fn reset(&mut self) {
+        self.ticks = 0;
+    }
 }
 
 pub fn parse_hotkey(text: &str) -> Option<(u32, u32)> {
@@ -440,6 +535,12 @@ fn process_name(pid: u32) -> Option<String> {
 }
 
 pub fn process_running(target: &str) -> bool {
+    let full_target = has_path(target);
+    let target_name = Path::new(target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(target)
+        .to_string();
     unsafe {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return false };
         let mut entry = PROCESSENTRY32W::default();
@@ -449,7 +550,27 @@ pub fn process_running(target: &str) -> bool {
             loop {
                 let end = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
                 let exe = String::from_utf16_lossy(&entry.szExeFile[..end]);
-                if exe_matches(target, &exe) {
+                let pid = entry.th32ProcessID;
+                let matched = if full_target {
+                    // Resolve the path only for the process that already has the
+                    // requested basename; opening every process would make the
+                    // once-per-second watcher needlessly expensive.
+                    if exe.eq_ignore_ascii_case(&target_name) {
+                        match process_path(pid) {
+                            Some(path) => exe_matches(target, &path.to_string_lossy()),
+                            // `OpenProcess` is denied for many anti-cheat
+                            // protected games; the snapshot still gives a
+                            // trustworthy basename, so use it as the
+                            // documented fallback.
+                            None => true,
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    exe_matches(target, &exe)
+                };
+                if matched {
                     found = true;
                     break;
                 }
@@ -475,10 +596,11 @@ pub fn current_foreground_app() -> Option<RunningApp> {
             return None;
         }
         let exe = process_name(pid)?;
+        let path = process_path(pid).map(|path| path.to_string_lossy().into_owned());
         let mut title = vec![0u16; 512];
         let len = GetWindowTextW(hwnd, &mut title);
         let title = String::from_utf16_lossy(&title[..len as usize]);
-        Some(RunningApp { exe, title, pid, icon: None })
+        Some(RunningApp { exe, path, title, pid, icon: None })
     }
 }
 
@@ -613,6 +735,7 @@ pub fn visible_apps() -> Vec<RunningApp> {
             } else {
                 apps.push(RunningApp {
                     exe,
+                    path: None,
                     title: String::from_utf16_lossy(&title).trim_matches('\0').to_string(),
                     pid,
                     icon: None,
@@ -638,7 +761,7 @@ pub fn visible_apps() -> Vec<RunningApp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, SlotModule};
+    use crate::config::{Config, CrosshairConfig, CrosshairPreset, SlotModule};
 
     fn slot(id: &str, emoji: &str) -> Slot {
         Slot {
@@ -697,6 +820,8 @@ mod tests {
             display_was_on: false,
             audio_was_on: false,
         };
+        baseline.crosshair.image = Some("C:\\live\\gone.png".into());
+        baseline.crosshair.image_name = Some("gone.png".into());
         baseline.crosshair.size = 900.0;
         baseline.crosshair.style = "bogus".into();
         baseline.display.global.brightness = 900.0;
@@ -709,7 +834,38 @@ mod tests {
         assert_eq!(config.crosshair.style, "plus", "an unknown style falls back");
         assert_eq!(config.display.global.brightness, 40.0, "the snapshot's brightness is clamped");
         assert_eq!(config.display.mode, "all", "an unknown display mode falls back");
+        assert!(config.crosshair.image.is_none(), "a vanished baseline image is cleared");
+        assert!(config.crosshair.image_name.is_none());
         assert!(config.slots.active.is_none() && config.slots.baseline.is_none());
+    }
+
+    #[test]
+    fn deactivation_drops_a_baseline_image_whose_file_vanished() {
+        let dir = std::env::temp_dir().join(format!(
+            "crosshairplus-slot-baseline-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("live.png"), b"png").unwrap();
+        let live = dir.join("live.png").to_string_lossy().to_string();
+
+        let mut config = Config::default();
+        config.crosshair.image = Some(live.clone());
+        config.crosshair.image_name = Some("live.png".into());
+        assert!(activate_slot(&mut config, "slot-fps").is_ok());
+        assert!(deactivate_slot(&mut config));
+        assert_eq!(config.crosshair.image.as_deref(), Some(live.as_str()), "a live baseline image stays");
+        assert_eq!(config.crosshair.image_name.as_deref(), Some("live.png"));
+
+        config.crosshair.image = Some("C:\\live\\gone.png".into());
+        config.crosshair.image_name = Some("gone.png".into());
+        assert!(activate_slot(&mut config, "slot-fps").is_ok());
+        assert!(deactivate_slot(&mut config));
+        assert!(config.crosshair.image.is_none(), "the vanished baseline image is cleared");
+        assert!(config.crosshair.image_name.is_none());
+        assert_eq!(config.crosshair.style, "plus", "the rest of the baseline is restored");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -718,12 +874,77 @@ mod tests {
         config.display.global.panel = "oled".into();
         config.crosshair.image = Some("keep.png".into());
         config.crosshair.monitor = Some("monitor-1".into());
+        config.crosshair.aim_button = Some("mouse5".into());
 
         assert!(activate_slot(&mut config, "slot-fps").is_ok());
         assert_eq!(config.display.global.panel, "oled");
         assert_eq!(config.crosshair.image.as_deref(), Some("keep.png"));
         assert_eq!(config.crosshair.monitor.as_deref(), Some("monitor-1"));
+        assert_eq!(config.crosshair.aim_button.as_deref(), Some("mouse5"), "a slot must keep the aim button");
         assert_eq!(config.crosshair.size, 16.0, "the slot applies the tuned T-Sight preset");
+    }
+
+    #[test]
+    fn slot_activation_keeps_the_current_image_when_the_preset_image_is_gone() {
+        let dir = std::env::temp_dir().join(format!(
+            "crosshairplus-slot-preset-image-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("present.png"), b"png").unwrap();
+        let present = dir.join("present.png").to_string_lossy().to_string();
+
+        std::fs::write(dir.join("live.png"), b"png").unwrap();
+        let live = dir.join("live.png").to_string_lossy().to_string();
+        let mut config = Config::default();
+        config.crosshair.image = Some(live.clone());
+        config.crosshair.image_name = Some("live.png".into());
+        config.crosshair.image_scale = 75.0;
+        config.custom.crosshair.push(CrosshairPreset {
+            id: "crosshair_image".into(),
+            name: "Image Aim".into(),
+            builtin: false,
+            config: CrosshairConfig {
+                image: Some("C:\\missing\\gone.png".into()),
+                image_name: Some("gone.png".into()),
+                image_scale: 180.0,
+                size: 24.0,
+                ..Default::default()
+            },
+        });
+        let mut image_slot = slot("slot-image", "🖼️");
+        image_slot.crosshair = SlotModule { on: true, preset: Some("crosshair_image".into()) };
+        config.slots.list.push(image_slot);
+
+        let warning = activate_slot(&mut config, "slot-image").unwrap();
+        assert_eq!(warning.as_deref(), Some("gone.png"));
+        assert_eq!(config.crosshair.image.as_deref(), Some(live.as_str()));
+        assert_eq!(config.crosshair.image_name.as_deref(), Some("live.png"));
+        assert_eq!(config.crosshair.image_scale, 75.0, "the preset's image tuning must not leak in");
+        assert_eq!(config.crosshair.size, 24.0, "the preset's shape still applies");
+        assert_eq!(config.crosshair.active_preset.as_deref(), Some("crosshair_image"));
+
+        // When the live picture is the vanished file too, the skipped preset
+        // image must clear it instead of carrying the dead path.
+        assert!(deactivate_slot(&mut config));
+        config.crosshair.image = Some("C:\\live\\gone.png".into());
+        config.crosshair.image_name = Some("gone.png".into());
+        let warning = activate_slot(&mut config, "slot-image").unwrap();
+        assert_eq!(warning.as_deref(), Some("gone.png"));
+        assert!(config.crosshair.image.is_none());
+        assert!(config.crosshair.image_name.is_none());
+        assert_eq!(config.crosshair.size, 24.0, "the preset's shape still applies");
+
+        // A file that still exists replaces the image block as before.
+        assert!(deactivate_slot(&mut config));
+        config.custom.crosshair[0].config.image = Some(present.clone());
+        config.custom.crosshair[0].config.image_name = Some("present.png".into());
+        assert_eq!(activate_slot(&mut config, "slot-image").unwrap(), None);
+        assert_eq!(config.crosshair.image.as_deref(), Some(present.as_str()));
+        assert_eq!(config.crosshair.image_name.as_deref(), Some("present.png"));
+        assert_eq!(config.crosshair.image_scale, 180.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -732,7 +953,9 @@ mod tests {
         config.crosshair.style = "plus".into();
         let mut edited = config.slots.list[0].clone();
         edited.name = "Edited Competitive".into();
-        assert!(switch_slot(&mut config, Some("slot-fps"), Some(edited)).unwrap());
+        let (changed, warning) = switch_slot(&mut config, Some("slot-fps"), Some(edited)).unwrap();
+        assert!(changed);
+        assert_eq!(warning, None);
         assert_eq!(config.slots.list[0].name, "Edited Competitive");
         assert_eq!(config.slots.active.as_deref(), Some("slot-fps"));
         assert!(config.slots.baseline.is_some());
@@ -768,6 +991,62 @@ mod tests {
 
         let duplicate = slot("slot-copy", "🦄");
         assert!(validate_slot(&config, &duplicate, true).is_err());
+    }
+
+    #[test]
+    fn full_path_matching_keeps_same_named_games_apart() {
+        assert!(exe_matches("C:\\Games\\A\\game.exe", "c:\\games\\a\\GAME.EXE"));
+        assert!(!exe_matches("C:\\Games\\A\\game.exe", "game.exe"));
+        assert!(basename_eq("C:\\Games\\A\\game.exe", "game.exe"));
+        assert!(exe_matches("game.exe", "C:\\Games\\B\\game.exe"));
+
+        let mut config = Config::default();
+        config.slots.list[0].target_exe = Some("C:\\Games\\A\\game.exe".into());
+        let elsewhere = RunningApp {
+            exe: "game.exe".into(),
+            path: Some("C:\\Games\\B\\game.exe".into()),
+            title: String::new(),
+            pid: 1,
+            icon: None,
+        };
+        assert_eq!(auto_activate_for_app(&config, &elsewhere), None);
+        let same = RunningApp {
+            exe: "game.exe".into(),
+            path: Some("C:\\Games\\A\\game.exe".into()),
+            title: String::new(),
+            pid: 1,
+            icon: None,
+        };
+        assert_eq!(auto_activate_for_app(&config, &same).as_deref(), Some("slot-fps"));
+        let denied = RunningApp { exe: "game.exe".into(), path: None, title: String::new(), pid: 1, icon: None };
+        assert_eq!(
+            auto_activate_for_app(&config, &denied).as_deref(),
+            Some("slot-fps"),
+            "denied process access falls back to the basename"
+        );
+    }
+
+    #[test]
+    fn deactivation_restores_modules_a_later_slot_did_not_touch() {
+        let mut config = Config::default();
+        config.crosshair.enabled = false;
+        config.display.enabled = false;
+        config.audio.enabled = false;
+        config.slots.list[0].crosshair.on = true;
+        config.slots.list[0].display.on = true;
+        config.slots.list[0].audio.on = false;
+        config.slots.list[1].crosshair.on = true;
+        config.slots.list[1].display.on = false;
+        config.slots.list[1].audio.on = false;
+
+        activate_slot(&mut config, "slot-fps").unwrap();
+        assert!(config.display.enabled);
+        activate_slot(&mut config, "slot-night").unwrap();
+        assert!(deactivate_slot(&mut config));
+        assert!(!config.crosshair.enabled);
+        assert!(!config.display.enabled, "display must revert even though slot B did not own it");
+        assert!(!config.audio.enabled);
+        assert!(!deactivate_slot(&mut config), "deactivation must be idempotent");
     }
 
     #[test]
@@ -834,6 +1113,17 @@ mod tests {
         assert!(validate_hotkey(&config, "F8", HotkeyOwner::Module("cycle")).is_err(), "Aim owns F8");
         assert!(validate_hotkey(&config, "Ctrl+Shift+End", HotkeyOwner::Module("cycle")).is_err(), "Reset is reserved");
         assert!(validate_hotkey(&config, "Ctrl+Shift+F11", HotkeyOwner::Module("cycle")).is_ok());
+    }
+
+    #[test]
+    fn auto_revert_waits_for_two_consecutive_absent_ticks() {
+        let mut absence = SlotAbsence::default();
+        assert!(!absence.observe(Some("slot-fps")), "one tick is only a splash blip");
+        assert!(absence.observe(Some("slot-fps")), "the second consecutive tick reverts");
+        absence.reset();
+        assert!(!absence.observe(Some("slot-fps")), "a running tick resets the count");
+        assert!(!absence.observe(Some("slot-night")), "a different slot starts a new count");
+        assert!(absence.observe(Some("slot-night")));
     }
 
     #[test]

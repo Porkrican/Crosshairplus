@@ -101,12 +101,23 @@ fn output_panels() -> Vec<OutputPanel> {
     panels
 }
 
-pub fn refresh() -> Vec<MonitorInfo> {
+pub fn refresh(probes: &crate::display::ddc::BacklightProbes) -> Vec<MonitorInfo> {
+    build(Some(probes))
+}
+
+/// Enumeration without DDC/WMI probes: safe before the first paint. The full
+/// probe runs on a worker once the window exists.
+pub fn quick() -> Vec<MonitorInfo> {
+    build(None)
+}
+
+fn build(probes: Option<&crate::display::ddc::BacklightProbes>) -> Vec<MonitorInfo> {
+    let probe_backlight = probes.is_some();
     let raw = enum_monitors();
     let targets = target_map();
     let panels = output_panels();
     let night = warning::night_light_active();
-    let wmi_supported = crate::display::ddc::wmi::supported();
+    let wmi_supported = probe_backlight && crate::display::ddc::wmi::supported();
     let wmi_brightness = if wmi_supported { crate::display::ddc::wmi::brightness() } else { None };
     let mut out: Vec<MonitorInfo> = raw
         .into_iter()
@@ -145,9 +156,13 @@ pub fn refresh() -> Vec<MonitorInfo> {
                 m.height
             ));
             let id = if device_path.is_empty() { m.gdi.clone() } else { device_path.clone() };
-            let (mut backlight_supported, mut backlight) = crate::display::ddc::brightness_for_gdi(&m.gdi)
-                .map(|v| (true, Some(v)))
-                .unwrap_or((false, None));
+            let (mut backlight_supported, mut backlight) = match probes {
+                Some(probes) => match probes.probe(&m.gdi) {
+                    Some(Some(value)) => (true, Some(value)),
+                    _ => (false, None),
+                },
+                None => (false, None),
+            };
             if !backlight_supported && m.primary && wmi_supported {
                 backlight_supported = true;
                 backlight = wmi_brightness;

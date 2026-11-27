@@ -347,6 +347,13 @@ fn normalize_scene(engine: &Engine, path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
+fn existing_icon_is_usable(engine: &Engine, path: &Path) -> bool {
+    match decode_png_bgra(engine, path) {
+        Ok((512, 512, pixels)) => pixels.chunks_exact(4).any(|px| px[3] > 0),
+        _ => false,
+    }
+}
+
 pub fn generate(engine: &Engine, root: &Path, overwrite_scenes: bool) -> Result<()> {
     std::fs::create_dir_all(root.join("presets")).map_err(|err| {
         windows::core::Error::new(
@@ -357,15 +364,23 @@ pub fn generate(engine: &Engine, root: &Path, overwrite_scenes: bool) -> Result<
 
     // Application icon: 512 PNG and a multi-size ICO, all rendered with the
     // DirectWrite color-font flag so the full-colour bow emoji stays crisp.
+    // Direct2D text rasterization can shift a pixel by one channel level
+    // between GPU runs, so preserve a valid tracked PNG instead of churning
+    // the file on every build. Delete it or damage it to force regeneration.
     println!("[gen_assets] engine ready");
     for (size, file) in [(512u32, "icon.png")] {
+        let path = root.join(file);
+        if existing_icon_is_usable(engine, &path) {
+            println!("[gen_assets] {file}: preserving existing {size}x{size} icon");
+            continue;
+        }
         println!("[gen_assets] text format {size}");
         let layout = engine.text("Segoe UI Emoji", size as f32 * 0.72, "\u{1F3F9}", Rgba::rgb(0xFFFFFF), size as f32, size as f32, DWRITE_FONT_WEIGHT_NORMAL)?;
         println!("[gen_assets] render png {size}");
         let png = engine.render_png(size, size, Rgba::rgb(0x000000).alpha(0.0), |_ctx| {
             engine.draw_text(&layout, Rgba::rgb(0xFFFFFF), 0.0, 0.0, true)
         })?;
-        write_asset(&root.join(file), &png)?;
+        write_asset(&path, &png)?;
     }
 
     println!("[gen_assets] icon.png done");

@@ -5,19 +5,19 @@ pub fn for_monitor(monitor: &MonitorInfo) -> Option<DisplayWarning> {
     if monitor.hdr {
         return Some(DisplayWarning {
             code: "hdr".into(),
-            message: format!("HDR is active on {}. Windows controls tone mapping while HDR is on.", monitor.name),
+            message: "Windows controls color, so calibration may not show.".into(),
         });
     }
     if monitor.advanced_color {
         return Some(DisplayWarning {
             code: "acm".into(),
-            message: format!("Advanced Color / ACM is active on {}. Automatic color management overrides gamma ramps.", monitor.name),
+            message: "It overrides calibration.".into(),
         });
     }
     if monitor.night_light {
         return Some(DisplayWarning {
             code: "night_light".into(),
-            message: format!("Night Light is active on {}. Turn it off to see calibration changes.", monitor.name),
+            message: "Turn it off to see changes.".into(),
         });
     }
     None

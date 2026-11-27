@@ -169,6 +169,13 @@ impl Engine {
     /// Returns (straight BGRA, premultiplied BGRA).  The straight copy is used by
     /// WIC/PNG and tests; the premultiplied copy feeds UpdateLayeredWindow.
     pub fn readback(&self, target: &Target) -> Result<(Vec<u8>, Vec<u8>)> {
+        let premul = self.readback_premultiplied(target)?;
+        Ok((unpremultiply(&premul), premul))
+    }
+
+    /// Read-back without the straight-alpha copy the layered-window path
+    /// throws away, which avoids a full-frame allocation and pass per paint.
+    pub fn readback_premultiplied(&self, target: &Target) -> Result<Vec<u8>> {
         unsafe {
             target.staging.CopyFromBitmap(None, &target.bitmap, None)?;
             let mapped = target.staging.Map(D2D1_MAP_OPTIONS_READ)?;
@@ -179,7 +186,7 @@ impl Engine {
                 premul.extend_from_slice(src);
             }
             target.staging.Unmap()?;
-            Ok((unpremultiply(&premul), premul))
+            Ok(premul)
         }
     }
 

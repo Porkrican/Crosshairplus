@@ -16,7 +16,7 @@ pub fn init() {
     std::panic::set_hook(Box::new(move |info| {
         log(&format!("PANIC: {info}"));
         log("safety: panic hook invoking restore");
-        crate::safety::restore_all_blocking();
+        crate::safety::restore_all_on_panic();
         // A sandboxed child test must not block on a modal dialog. Normal
         // launches still show the recovery message.
         if crate::config::sandbox_root().is_none() {
@@ -108,7 +108,7 @@ mod tests {
         let panic_log = fs::read_to_string(panic_sandbox.join("data\\crosshair.log")).unwrap();
         assert!(panic_log.contains("PANIC:"), "panic hook did not write the panic line: {panic_log}");
         assert!(panic_log.contains("safety: panic hook invoking restore"), "panic hook did not reach restore: {panic_log}");
-        assert!(panic_log.contains("safety: restored OS display ramps and FxSound baseline"), "panic restore did not finish: {panic_log}");
+        assert!(panic_log.contains("safety: panic restore finished"), "panic restore did not finish: {panic_log}");
         assert!(panic_log.contains("safety: sandbox; FxSound restore skipped"), "sandbox restore touched FxSound: {panic_log}");
         let _ = fs::remove_dir_all(&panic_sandbox);
 

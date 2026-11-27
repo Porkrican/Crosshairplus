@@ -103,8 +103,18 @@ pub fn set_settings(config: &mut Config, settings: Settings, store_path: &Path) 
 pub fn factory_reset(config: &mut Config, store_path: &Path, data_dir: &Path) -> Result<(bool, usize), String> {
     let removed_config = store_path.exists();
     // Remove the preserved copies too, or the old settings stay on disk after
-    // a reset. `backup_path` is the same path `Config::save_to` writes.
-    for stale in [crate::config::backup_path(store_path), store_path.with_extension("tmp")] {
+    // a reset. `backup_path` is the same path `Config::save_to` writes. The
+    // recovery snapshot, restore undo, game cache and FxSound ownership marker
+    // are session state and must not survive a factory reset either.
+    for stale in [
+        crate::config::backup_path(store_path),
+        crate::config::corrupt_path(store_path),
+        store_path.with_extension("tmp"),
+        crate::backup::pre_restore_path(data_dir),
+        data_dir.join("safety-recovery.json"),
+        data_dir.join("games.json"),
+        data_dir.join("fxsound-preset.json"),
+    ] {
         remove_if_exists(&stale)?;
     }
     let images = data_dir.join("crosshairs");
@@ -362,8 +372,18 @@ mod tests {
         fs::write(images.join("imported.png"), b"x").unwrap();
         let stale = crate::config::backup_path(&reset_store.path);
         fs::write(&stale, b"{}").unwrap();
+        let corrupt = crate::config::corrupt_path(&reset_store.path);
+        fs::write(&corrupt, b"{}").unwrap();
         let tmp = reset_store.path.with_extension("tmp");
         fs::write(&tmp, b"{}").unwrap();
+        let undo = crate::backup::pre_restore_path(&reset_store.data);
+        fs::write(&undo, b"{}").unwrap();
+        let recovery = reset_store.data.join("safety-recovery.json");
+        fs::write(&recovery, b"{}").unwrap();
+        let game_cache = reset_store.data.join("games.json");
+        fs::write(&game_cache, b"[]").unwrap();
+        let preset_owner = reset_store.data.join("fxsound-preset.json");
+        fs::write(&preset_owner, b"{}").unwrap();
         let mut custom = reset_store.load();
         custom.crosshair.enabled = true;
         custom.settings.start_with_windows = true;
@@ -374,7 +394,13 @@ mod tests {
         assert_eq!(reset_store.load(), Config::default(), "factory reset did not persist defaults");
         assert!(!images.exists(), "factory reset left imported images behind");
         assert!(!stale.exists(), "factory reset left the erased-config backup behind");
+        assert!(!corrupt.exists(), "factory reset left the corrupt-config quarantine behind");
         assert!(!tmp.exists(), "factory reset left a stale atomic-save temp file behind");
+        assert!(!undo.exists(), "factory reset left the restore undo copy behind");
+        assert!(!recovery.exists(), "factory reset left a crash-recovery snapshot behind");
+        assert!(!game_cache.exists(), "factory reset left the game cache behind");
+        assert!(!preset_owner.exists(), "factory reset left the FxSound ownership marker behind");
+        assert!(!crate::backup::restore_undo_available(&reset_store.data), "restore undo must be unavailable after a reset");
 
         let display_store = TempStore::new("reset-display");
         let mut custom = display_store.load();

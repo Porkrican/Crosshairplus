@@ -1,8 +1,10 @@
-use std::sync::mpsc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use windows::core::BOOL;
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::Devices::Display::{
     DestroyPhysicalMonitors, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR,
     SetMonitorBrightness, PHYSICAL_MONITOR,
@@ -76,7 +78,7 @@ fn raw_from_percent(min: u32, max: u32, percent: u32) -> Option<u32> {
     Some(min + (((max - min) as f32) * percent.clamp(0, 100) as f32 / 100.0).round() as u32)
 }
 
-pub fn brightness_for_gdi(gdi: &str) -> Option<u32> {
+fn brightness_for_gdi(gdi: &str) -> Option<u32> {
     let (monitors, (min, current, max)) = physical(gdi)?;
     unsafe {
         let _ = DestroyPhysicalMonitors(&monitors);
@@ -84,7 +86,7 @@ pub fn brightness_for_gdi(gdi: &str) -> Option<u32> {
     percent_from_raw(min, current, max)
 }
 
-pub fn set_brightness_for_gdi(gdi: &str, percent: u32) -> bool {
+fn set_brightness_for_gdi(gdi: &str, percent: u32) -> bool {
     let Some((monitors, (min, _, max))) = physical(gdi) else { return false };
     let Some(target) = raw_from_percent(min, max, percent) else {
         unsafe {
@@ -99,46 +101,149 @@ pub fn set_brightness_for_gdi(gdi: &str, percent: u32) -> bool {
     ok
 }
 
+const PROBE_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct BacklightCache {
+    entries: HashMap<String, (Instant, Option<u32>)>,
+    /// GDI names with a probe queued on the pacer thread. A display-change
+    /// burst can enqueue a refresh several times before the first reply lands.
+    pending: HashSet<String>,
+}
+
+enum BacklightRequest {
+    Set { gdi: String, percent: u32 },
+    Probe { gdi: String },
+}
+
+/// A cloneable handle used by the monitor worker to read the last probe result
+/// and queue one refresh when the TTL has elapsed. It never blocks and never
+/// talks to the display itself.
+#[derive(Clone)]
+pub struct BacklightProbes {
+    tx: mpsc::Sender<BacklightRequest>,
+    cache: Arc<Mutex<BacklightCache>>,
+}
+
+impl BacklightProbes {
+    /// The known value (Some(Some(percent)) for a DDC panel, Some(None) when
+    /// the panel rejected DDC), or None before the first reply. Stale values
+    /// are returned immediately while a fresh probe is queued.
+    pub fn probe(&self, gdi: &str) -> Option<Option<u32>> {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let known = cache.entries.get(gdi).map(|(_, value)| *value);
+        let fresh = cache
+            .entries
+            .get(gdi)
+            .map(|(at, _)| at.elapsed() < PROBE_TTL)
+            .unwrap_or(false);
+        if !fresh && cache.pending.insert(gdi.to_string()) {
+            drop(cache);
+            if self.tx.send(BacklightRequest::Probe { gdi: gdi.to_string() }).is_err() {
+                self.cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .remove(gdi);
+                crate::logging::log("display: backlight worker unavailable; probe dropped");
+            }
+        }
+        known
+    }
+}
+
+fn finish_probe(
+    cache: &Mutex<BacklightCache>,
+    results: &mpsc::Sender<(String, Option<u32>)>,
+    gdi: &str,
+) {
+    let value = brightness_for_gdi(gdi);
+    {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.entries.insert(gdi.to_string(), (Instant::now(), value));
+        cache.pending.remove(gdi);
+    }
+    let _ = results.send((gdi.to_string(), value));
+}
+
+/// Owns the only thread that performs DDC reads and writes. Sets are paced to
+/// avoid hammering the panel; probes are ordinary requests on the same queue,
+/// with their replies delivered through `poll`.
 pub struct BacklightPacer {
-    tx: mpsc::Sender<(String, u32)>,
+    tx: mpsc::Sender<BacklightRequest>,
+    cache: Arc<Mutex<BacklightCache>>,
+    results: mpsc::Receiver<(String, Option<u32>)>,
 }
 
 impl BacklightPacer {
     pub fn start() -> Self {
-        let (tx, rx) = mpsc::channel::<(String, u32)>();
+        let (tx, rx) = mpsc::channel::<BacklightRequest>();
+        let (result_tx, results) = mpsc::channel::<(String, Option<u32>)>();
+        let cache = Arc::new(Mutex::new(BacklightCache::default()));
+        let worker_cache = Arc::clone(&cache);
         thread::spawn(move || {
+            // DXVA2/WMI both need COM on the thread that actually calls them.
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
             let mut last = Instant::now() - Duration::from_secs(1);
             while let Ok(first) = rx.recv() {
-                let mut pending = first;
-                let deadline = Instant::now() + Duration::from_millis(60);
-                loop {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
+                match first {
+                    BacklightRequest::Probe { gdi } => {
+                        finish_probe(&worker_cache, &result_tx, &gdi);
                     }
-                    match rx.recv_timeout(remaining) {
-                        Ok(next) => pending = next,
-                        Err(_) => break,
+                    BacklightRequest::Set { gdi, percent } => {
+                        let mut pending = (gdi, percent);
+                        let deadline = Instant::now() + Duration::from_millis(60);
+                        loop {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+                            match rx.recv_timeout(remaining) {
+                                Ok(BacklightRequest::Set { gdi, percent }) => pending = (gdi, percent),
+                                Ok(BacklightRequest::Probe { gdi }) => {
+                                    finish_probe(&worker_cache, &result_tx, &gdi);
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let wait = Duration::from_millis(50).saturating_sub(last.elapsed());
+                        if !wait.is_zero() {
+                            thread::sleep(wait);
+                        }
+                        let applied = set_brightness_for_gdi(&pending.0, pending.1) || wmi::set(pending.1);
+                        if applied {
+                            worker_cache
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .entries
+                                .insert(pending.0.clone(), (Instant::now(), Some(pending.1)));
+                        } else {
+                            crate::logging::log(&format!("display: backlight {}% rejected for {}", pending.1, pending.0));
+                        }
+                        last = Instant::now();
                     }
                 }
-                let wait = Duration::from_millis(50).saturating_sub(last.elapsed());
-                if !wait.is_zero() {
-                    thread::sleep(wait);
-                }
-                if !set_brightness_for_gdi(&pending.0, pending.1) {
-                    if !wmi::set(pending.1) {
-                        crate::logging::log(&format!("display: backlight {}% rejected for {}", pending.1, pending.0));
-                    }
-                }
-                last = Instant::now();
+            }
+            if com {
+                unsafe { CoUninitialize() };
             }
         });
-        Self { tx }
+        Self { tx, cache, results }
     }
+
+    pub fn handle(&self) -> BacklightProbes {
+        BacklightProbes { tx: self.tx.clone(), cache: Arc::clone(&self.cache) }
+    }
+
     pub fn set(&self, gdi: String, percent: u32) {
-        if self.tx.send((gdi, percent)).is_err() {
+        if self.tx.send(BacklightRequest::Set { gdi, percent }).is_err() {
             crate::logging::log("display: backlight worker unavailable; request dropped");
         }
+    }
+
+    /// Non-blocking: every probe reply since the last poll.
+    pub fn poll(&self) -> Option<(String, Option<u32>)> {
+        self.results.try_recv().ok()
     }
 }
 

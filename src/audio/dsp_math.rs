@@ -87,6 +87,30 @@ pub fn fx_bands(audio: &AudioConfig) -> (Vec<f32>, Vec<f32>) {
     (freqs, gains)
 }
 
+/// A temporary flat curve for Sound's Hold to Compare. FxSound stays powered
+/// on (`--power=1`) so Windows never drops and re-adds the virtual endpoint;
+/// only the EQ and effects are neutralised. The device and filter Q survive so
+/// release is the only thing that changes.
+pub fn flat_compare(audio: &AudioConfig) -> AudioConfig {
+    AudioConfig {
+        enabled: true,
+        device: audio.device.clone(),
+        bands: [0.0; 10],
+        bass: 0.0,
+        treble: 0.0,
+        output_level: 0.0,
+        echo: 0.0,
+        surround: 0.0,
+        dynamic_boost: 0.0,
+        volume_leveling: 0.0,
+        balance: 0.0,
+        filter_q: audio.filter_q,
+        volume_guard: audio.volume_guard,
+        imported: None,
+        active_preset: None,
+    }
+}
+
 pub fn peak_gain(gains: &[f32]) -> f32 {
     gains.iter().cloned().fold(-60.0f32, f32::max)
 }

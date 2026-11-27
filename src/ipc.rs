@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::audio::{AudioDevice, FxSoundStatus};
-use crate::config::{AudioConfig, AudioPreset, Config, CrosshairConfig, CrosshairPreset, DisplayConfig, DisplayPreset, Settings, Slot};
+use crate::config::{AudioConfig, AudioPreset, Config, CrosshairConfig, CrosshairPreset, DisplayConfig, DisplayPreset, Settings, Slot, StoredImage};
 use crate::monitors::MonitorInfo;
 use crate::slots::RunningApp;
 
@@ -32,7 +32,10 @@ pub enum Event {
     FxSoundStatusEvent { #[serde(flatten)] status: FxSoundStatus },
     BackupPreview { preview: crate::backup::BackupPreview },
     BackupResult { ok: bool, message: String },
+    StoredImageResult { name: String, ok: bool },
+    RecentImages { images: Vec<StoredImage> },
     HotkeyConflict { #[serde(rename = "slotId")] slot_id: Option<String>, key: String, owner: String },
+    HotkeyResolved { #[serde(rename = "slotId")] slot_id: Option<String>, key: String },
     DiagnosticBanner { code: String, message: String, recoverable: bool },
     AudioRecovery { code: String, message: String, actions: Vec<DiagnosticAction> },
 }
@@ -71,6 +74,9 @@ pub struct FullStatePayload {
     pub launch_at_login: bool,
     /// A restore left a safety copy that the UI can offer to undo.
     pub can_undo_restore: bool,
+    /// Images already stored in the data folder, newest first. The Recent menu
+    /// reads this instead of opening a picker again.
+    pub crosshair_images: Vec<StoredImage>,
 }
 
 pub fn to_script(event: Event) -> String {
@@ -113,14 +119,18 @@ pub enum Command {
     UpdateCrosshair { crosshair: CrosshairConfig },
     UpdateDisplay { display: DisplayConfig },
     CompareDisplay { active: bool },
+    CompareSound { active: bool },
     UpdateSound { audio: AudioConfig },
-    SavePreset { module: String, name: String },
+    SavePreset { module: String, name: String, image_mode: bool },
     DeletePreset { module: String, id: String },
     AssignHotkey { slot_id: String, hotkey: String },
     ClearHotkey { slot_id: String },
     AssignModuleHotkey { module: String, hotkey: String },
     ClearModuleHotkey { module: String },
     ImportImage { path: Option<String> },
+    RefreshRecentImages,
+    UseStoredImage { name: String },
+    DeleteStoredImage { name: String },
     RemoveImage,
     ImportEq { path: Option<String>, text: Option<String>, name: Option<String> },
     FlattenEqImport,
@@ -166,6 +176,7 @@ impl Command {
             Command::UpdateCrosshair { .. } => "UpdateCrosshair",
             Command::UpdateDisplay { .. } => "UpdateDisplay",
             Command::CompareDisplay { .. } => "CompareDisplay",
+            Command::CompareSound { .. } => "CompareSound",
             Command::UpdateSound { .. } => "UpdateSound",
             Command::SavePreset { .. } => "SavePreset",
             Command::DeletePreset { .. } => "DeletePreset",
@@ -174,6 +185,9 @@ impl Command {
             Command::AssignModuleHotkey { .. } => "AssignModuleHotkey",
             Command::ClearModuleHotkey { .. } => "ClearModuleHotkey",
             Command::ImportImage { .. } => "ImportImage",
+            Command::RefreshRecentImages => "RefreshRecentImages",
+            Command::UseStoredImage { .. } => "UseStoredImage",
+            Command::DeleteStoredImage { .. } => "DeleteStoredImage",
             Command::RemoveImage => "RemoveImage",
             Command::ImportEq { .. } => "ImportEq",
             Command::FlattenEqImport => "FlattenEqImport",
@@ -218,6 +232,14 @@ pub fn is_verify_report(text: &str) -> bool {
         && value.get("type").and_then(Value::as_str) == Some("VerifyReport")
 }
 
+/// The verify page's per-path overlay check. Like the other reports it is only
+/// accepted in the sandboxed verifier and is never a command.
+pub fn is_verify_overlay(text: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(text) else { return false };
+    value.get("v").and_then(Value::as_u64) == Some(1)
+        && value.get("type").and_then(Value::as_str) == Some("VerifyOverlay")
+}
+
 /// The `--stress` harness posts its verdict through the same bridge it just
 /// tortured; like the other verify reports it is not a command.
 pub fn is_stress_report(text: &str) -> bool {
@@ -250,11 +272,12 @@ pub fn parse(text: &str) -> Option<Command> {
         "ToggleMaster" => Command::ToggleMaster { module: p::<ModulePayload>(raw.payload)?.module },
         "UpdateCrosshair" => Command::UpdateCrosshair { crosshair: p::<CrosshairPayload>(raw.payload)?.crosshair },
         "UpdateDisplay" => Command::UpdateDisplay { display: p::<DisplayPayload>(raw.payload)?.display },
-        "CompareDisplay" => Command::CompareDisplay { active: p::<CompareDisplayPayload>(raw.payload)?.active },
+        "CompareDisplay" => Command::CompareDisplay { active: p::<ComparePayload>(raw.payload)?.active },
+        "CompareSound" => Command::CompareSound { active: p::<ComparePayload>(raw.payload)?.active },
         "UpdateSound" => Command::UpdateSound { audio: p::<AudioPayload>(raw.payload)?.audio },
         "SavePreset" => {
             let v = p::<SavePresetPayload>(raw.payload)?;
-            Command::SavePreset { module: v.module, name: v.name }
+            Command::SavePreset { module: v.module, name: v.name, image_mode: v.image_mode }
         }
         "DeletePreset" => {
             let v = p::<DeletePresetPayload>(raw.payload)?;
@@ -271,6 +294,9 @@ pub fn parse(text: &str) -> Option<Command> {
         }
         "ClearModuleHotkey" => Command::ClearModuleHotkey { module: p::<ModulePayload>(raw.payload)?.module },
         "ImportImage" => Command::ImportImage { path: p::<PathPayload>(raw.payload)?.path },
+        "RefreshRecentImages" => Command::RefreshRecentImages,
+        "UseStoredImage" => Command::UseStoredImage { name: p::<ImageNamePayload>(raw.payload)?.name },
+        "DeleteStoredImage" => Command::DeleteStoredImage { name: p::<ImageNamePayload>(raw.payload)?.name },
         "RemoveImage" => Command::RemoveImage,
         "ImportEq" => {
             let v = p::<ImportEqPayload>(raw.payload)?;
@@ -326,11 +352,18 @@ struct CrosshairPayload { crosshair: CrosshairConfig }
 #[derive(Deserialize)]
 struct DisplayPayload { display: DisplayConfig }
 #[derive(Deserialize)]
-struct CompareDisplayPayload { active: bool }
+struct ComparePayload { active: bool }
 #[derive(Deserialize)]
 struct AudioPayload { audio: AudioConfig }
 #[derive(Deserialize)]
-struct SavePresetPayload { module: String, name: String }
+struct SavePresetPayload {
+    module: String,
+    name: String,
+    #[serde(default, rename = "imageMode")]
+    image_mode: bool,
+}
+#[derive(Deserialize)]
+struct ImageNamePayload { name: String }
 #[derive(Deserialize)]
 struct DeletePresetPayload { module: String, id: String }
 #[derive(Deserialize)]
@@ -363,6 +396,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stored_image_result_serializes_for_the_ui() {
+        let script = to_script(Event::StoredImageResult { name: "1700-gone.png".into(), ok: false });
+        assert!(script.contains("\"type\":\"StoredImageResult\""), "{script}");
+        assert!(script.contains("\"name\":\"1700-gone.png\""), "{script}");
+        assert!(script.contains("\"ok\":false"), "{script}");
+    }
+
+    #[test]
+    fn recent_images_serialize_for_the_ui() {
+        let script = to_script(Event::RecentImages {
+            images: vec![StoredImage { label: "aim.png".into(), name: "1700-aim.png".into() }],
+        });
+        assert!(script.contains("\"type\":\"RecentImages\""), "{script}");
+        assert!(script.contains("\"label\":\"aim.png\""), "{script}");
+        assert!(script.contains("\"name\":\"1700-aim.png\""), "{script}");
+    }
+
+    #[test]
     fn parses_every_plan_command() {
         let commands = [
             (r#"{"v":1,"type":"Ready"}"#, "Ready"),
@@ -371,14 +422,19 @@ mod tests {
             (r#"{"v":1,"type":"UpdateCrosshair","payload":{"crosshair":{}}}"#, "UpdateCrosshair"),
             (r#"{"v":1,"type":"UpdateDisplay","payload":{"display":{}}}"#, "UpdateDisplay"),
             (r#"{"v":1,"type":"CompareDisplay","payload":{"active":true}}"#, "CompareDisplay"),
+            (r#"{"v":1,"type":"CompareSound","payload":{"active":true}}"#, "CompareSound"),
             (r#"{"v":1,"type":"UpdateSound","payload":{"audio":{}}}"#, "UpdateSound"),
             (r#"{"v":1,"type":"SavePreset","payload":{"module":"audio","name":"Mine"}}"#, "SavePreset"),
+            (r#"{"v":1,"type":"SavePreset","payload":{"module":"crosshair","name":"Image","imageMode":true}}"#, "SavePresetImageMode"),
             (r#"{"v":1,"type":"DeletePreset","payload":{"module":"audio","id":"x"}}"#, "DeletePreset"),
             (r#"{"v":1,"type":"AssignHotkey","payload":{"slotId":"slot-fps","hotkey":"F12"}}"#, "AssignHotkey"),
             (r#"{"v":1,"type":"ClearHotkey","payload":{"slotId":"slot-fps"}}"#, "ClearHotkey"),
             (r#"{"v":1,"type":"AssignModuleHotkey","payload":{"module":"display","hotkey":"Ctrl+Shift+1"}}"#, "AssignModuleHotkey"),
             (r#"{"v":1,"type":"ClearModuleHotkey","payload":{"module":"display"}}"#, "ClearModuleHotkey"),
             (r#"{"v":1,"type":"ImportImage","payload":{"path":null}}"#, "ImportImage"),
+            (r#"{"v":1,"type":"RefreshRecentImages"}"#, "RefreshRecentImages"),
+            (r#"{"v":1,"type":"UseStoredImage","payload":{"name":"1700-aim.png"}}"#, "UseStoredImage"),
+            (r#"{"v":1,"type":"DeleteStoredImage","payload":{"name":"1700-aim.png"}}"#, "DeleteStoredImage"),
             (r#"{"v":1,"type":"RemoveImage"}"#, "RemoveImage"),
             (r#"{"v":1,"type":"ImportEq","payload":{"path":null,"text":null}}"#, "ImportEq"),
             (r#"{"v":1,"type":"FlattenEqImport"}"#, "FlattenEqImport"),
@@ -425,6 +481,9 @@ mod tests {
         assert!(!is_fx_verify_report(r#"{"v":1,"type":"VerifyReport","payload":{"ok":true}}"#));
         assert!(!is_verify_report(r#"{"v":2,"type":"VerifyReport"}"#));
         assert!(!is_verify_report(r#"{"v":1,"type":"Ready"}"#));
+        assert!(is_verify_overlay(r#"{"v":1,"type":"VerifyOverlay","payload":{"path":"use"}}"#));
+        assert!(!is_verify_overlay(r#"{"v":1,"type":"VerifyReport"}"#));
+        assert!(!is_verify_overlay(r#"{"v":2,"type":"VerifyOverlay"}"#));
     }
 
     #[test]
